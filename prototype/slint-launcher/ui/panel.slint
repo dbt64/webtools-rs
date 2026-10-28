@@ -1,0 +1,571 @@
+// Geometry and colors follow SuperPanelWindow.xaml. All dimensions are DIPs.
+export struct PanelAction { title: string, hint: string }
+
+import { HostTheme as PanelColors } from "theme.slint";
+
+component PanelText inherits Text {
+    font-family: "Segoe UI";
+    font-size: 13px;
+    color: PanelColors.text;
+    overflow: elide;
+    vertical-alignment: center;
+}
+
+component PanelGlyph inherits Text {
+    font-family: "Segoe Fluent Icons";
+    font-size: 16px;
+    color: PanelColors.text;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+}
+
+component PanelButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> icon: false;
+    in property <bool> enabled: true;
+    in property <bool> focused: false;
+    in property <bool> selected: false;
+    in property <length> pad-x: 8px;
+    in property <length> pad-y: 8px;
+    in property <length> text-size: 12px;
+    callback activated();
+    width: label.preferred-width + 2 * root.pad-x + 2px;
+    height: label.preferred-height + 2 * root.pad-y + 2px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.focused ? PanelColors.accent : transparent;
+    background: hit.pressed ? PanelColors.selected :
+        (hit.has-hover ? PanelColors.hover : (root.selected ? PanelColors.selected : transparent));
+    opacity: root.enabled ? 1 : 0.45;
+    label := PanelText {
+        x: root.pad-x + 1px; y: root.pad-y + 1px;
+        width: parent.width - 2 * (root.pad-x + 1px);
+        height: parent.height - 2 * (root.pad-y + 1px);
+        text: root.text; font-size: root.text-size;
+        font-family: root.icon ? "Segoe Fluent Icons" : "Segoe UI";
+        horizontal-alignment: center;
+    }
+    hit := TouchArea {
+        width: 100%; height: 100%; enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+component PanelIcon inherits Rectangle {
+    in property <string> glyph: "\u{E8A5}";
+    in property <image> image;
+    in property <bool> has-image: false;
+    width: 26px; height: 26px;
+    border-radius: 8px; background: PanelColors.raised;
+    if root.has-image: Image {
+        x: 1px; y: 1px; width: 24px; height: 24px;
+        source: root.image; image-fit: contain;
+    }
+    if !root.has-image: PanelGlyph {
+        width: 100%; height: 100%; text: root.glyph;
+    }
+}
+
+// Content is clipped to the viewport; the slim thumb is outside the scrolled tree.
+component PanelScroll inherits Rectangle {
+    in property <length> body-height;
+    in property <bool> reserve-scrollbar: false;
+    in-out property <length> offset <=> scroll.content-y;
+    scroll := Flickable {
+        x: 0px; y: 0px; width: parent.width - (root.reserve-scrollbar ? 8px : 0px); height: 100%;
+        content-width: self.width;
+        content-height: max(self.height, root.body-height);
+        mouse-drag-pan-enabled: false;
+        @children
+    }
+    if root.body-height > root.height: Rectangle {
+        x: parent.width - 8px; width: 8px;
+        height: min(parent.height, max(18px, parent.height * parent.height / root.body-height));
+        y: -root.offset / max(1px, root.body-height - root.height) * (root.height - self.height);
+        in-out property <length> drag-start;
+        Rectangle {
+            x: 3px; width: 3px; height: 100%; border-radius: 2px;
+            background: PanelColors.muted;
+        }
+        drag := TouchArea {
+            width: 100%; height: 100%;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down { parent.drag-start = root.offset; }
+            }
+            moved => {
+                if self.pressed {
+                    root.offset = clamp(parent.drag-start -
+                        (self.mouse-y - self.pressed-y) * root.body-height / max(1px, root.height),
+                        root.height - root.body-height, 0px);
+                }
+            }
+        }
+    }
+}
+
+export component SuperPanel inherits Window {
+    title: "WebTools Super Panel";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px;
+    width: min(root.is-board ? 254px : 290px, root.available-width);
+    height: clamp(root.desired-height, min(root.is-board ? 0px : 140px, root.available-height), root.available-height);
+
+    // Existing Rust interface. Do not change these types or names.
+    in-out property <string> mode: "context";
+    in property <string> context-kind: "text";
+    in property <string> context-title: "已选文本";
+    in property <string> context-text;
+    in property <string> context-meta;
+    in property <string> context-name;
+    in property <string> context-path;
+    in property <[string]> context-items;
+    in property <[PanelAction]> actions;
+    in property <[PanelAction]> board;
+    in property <string> page-label: "1 / 1";
+    in-out property <bool> result-visible: false;
+    in-out property <string> result-source;
+    in-out property <string> result-body;
+    in property <string> notice;
+    callback action-chosen(int);
+    callback board-chosen(int);
+    callback board-page(int);
+    callback board-add();
+    callback board-context-action(int, int);
+    callback board-reorder(int, int);
+    callback open-search();
+    callback close-result();
+
+    // Optional presentation inputs; the host can supply work-area bounds and icons.
+    in property <length> available-width: 290px;
+    in property <length> available-height: 550px;
+    in property <string> panel-title: "WebTools";
+    in property <string> context-overflow;
+    in property <string> status-text;
+    in property <[string]> action-glyphs;
+    in property <[image]> action-images;
+    in property <[bool]> action-has-images;
+    in property <[bool]> action-enabled;
+    in property <[string]> board-glyphs;
+    in property <[image]> board-images;
+    in property <[bool]> board-has-images;
+    in property <[bool]> board-enabled;
+    in property <int> pages: 1;
+    in property <bool> add-shortcut-visible: false;
+    in property <bool> previous-page-enabled: true;
+    in property <bool> next-page-enabled: true;
+    in property <bool> result-cancel-visible: false;
+    in-out property <bool> consent-visible: false;
+    in property <string> consent-source;
+    in property <string> consent-preview;
+    in-out property <bool> chooser-visible: false;
+    in property <[PanelAction]> chooser-items;
+    callback consent-approved();
+    callback consent-cancelled();
+    callback chooser-chosen(int);
+    in-out property <int> selected-action: -1;
+    in-out property <int> selected-board: -1;
+    private property <bool> board-menu-visible: false;
+    private property <int> board-menu-index: -1;
+    private property <length> board-menu-x: 0px;
+    private property <length> board-menu-y: 0px;
+    private property <int> drag-board-index: -1;
+    private property <int> drag-board-target: -1;
+    private property <bool> drag-board-active: false;
+    private property <bool> board-click-suppressed: false;
+    private property <bool> is-board: root.mode == "board" || root.context-kind == "none" ||
+        root.context-kind == "" || root.context-kind == "board";
+    private property <length> inner-width: max(0px, root.width - 26px);
+    private property <int> shown-items: min(3, root.context-items.length);
+    private property <string> overflow-label: root.context-overflow != "" ? root.context-overflow :
+        (root.context-items.length > 3 ? "另有 \{root.context-items.length - 3} 项" : "");
+    private property <length> notice-height: root.notice == "" ? 0px : notice-label.preferred-height + 8px;
+    private property <length> status-height: root.status-text == "" ? 0px : status-label.preferred-height + 8px;
+    private property <length> folder-height: 21px + root.shown-items * 24px +
+        (root.overflow-label == "" ? 0px : 19px) + 19px;
+    private property <length> files-height: 42px + root.shown-items * 19px +
+        (root.overflow-label == "" ? 0px : 19px);
+    private property <length> action-label-height: root.actions.length > 0 ? 19px : 0px;
+    private property <length> result-static-height: root.result-cancel-visible ? 58px : 51px;
+    private property <length> consent-static-height: 20px + consent-heading.preferred-height +
+        12px + consent-source-label.preferred-height + 8px + 28px + 10px;
+    private property <bool> show-result: root.result-visible && !root.consent-visible;
+    private property <length> quick-static-height: root.consent-visible ? root.consent-static-height :
+        (root.show-result ? root.result-static-height : 0px);
+    private property <length> quick-wanted: root.consent-visible ?
+        min(120px, max(15px, consent-body.preferred-height)) :
+        (root.show-result ? min(220px, max(18px, ceil(result-body-label.preferred-height / 18px) * 18px)) : 0px);
+    // As in WPF UpdatePanelLayout, omit the preview card only after one 18-DIP
+    // line plus a 44-DIP action viewport no longer fits the work area.
+    private property <bool> text-card-shown: root.context-kind == "text" &&
+        root.available-height >= 64px + root.quick-static-height + root.action-label-height +
+            root.notice-height + root.status-height + 51px + 18px + root.action-minimum +
+            (root.quick-wanted > 0px ? 18px : 0px);
+    private property <length> context-static-height: root.context-kind == "text" ? (root.text-card-shown ? 51px : 0px) :
+        (root.context-kind == "folder" ? root.folder-height : (root.context-kind == "explorer" ? 86px : 0px));
+    private property <length> chrome-height: 64px + root.context-static-height + root.quick-static-height +
+        root.action-label-height + (root.context-kind == "files" ? root.files-height : 0px) +
+        root.notice-height + root.status-height;
+    private property <length> action-minimum: root.actions.length > 0 ? 44px : 38px;
+    // Keep at least one action reachable, shrinking the optional preview in 18-DIP lines first.
+    private property <length> preview-height: root.text-card-shown ?
+        max(18px, floor(min(54px, max(18px, ceil(text-preview.preferred-height / 18px) * 18px),
+            root.available-height - root.chrome-height - root.quick-wanted - root.action-minimum) / 18px) * 18px) : 0px;
+    private property <length> quick-body-height: root.quick-wanted == 0px ? 0px :
+        max(18px, min(root.quick-wanted, root.available-height - root.chrome-height -
+            root.preview-height - root.action-minimum));
+    private property <length> context-head-height: root.context-static-height + root.preview-height;
+    private property <length> quick-height: root.quick-static-height + root.quick-body-height;
+    private property <length> actions-height: root.actions.length == 0 ? 38px :
+        min(240px, max(44px, min(root.actions.length * 40px,
+            root.available-height - root.chrome-height - root.preview-height - root.quick-body-height)));
+    private property <length> context-height: root.context-head-height + root.quick-height +
+        root.action-label-height + root.actions-height + (root.context-kind == "files" ? root.files-height : 0px);
+    private property <length> tile-side: max(1px, min(72px, (root.inner-width / 3) - 4px,
+        (root.available-height - 64px - root.notice-height - root.status-height - 36px) / 3 - 4px));
+    private property <length> grid-side: (root.tile-side + 4px) * 3;
+    private property <length> board-height: root.grid-side + 36px;
+    private property <length> desired-height: 64px + (root.is-board ? root.board-height : root.context-height) +
+        root.notice-height + root.status-height;
+
+    forward-focus: keys;
+    keys := FocusScope {
+        width: 100%; height: 100%;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.consent-visible {
+                    root.consent-visible = false; root.consent-cancelled();
+                } else if root.result-visible {
+                    root.result-visible = false; root.close-result();
+                } else if root.chooser-visible {
+                    root.chooser-visible = false;
+                } else if root.board-menu-visible {
+                    root.board-menu-visible = false;
+                } else { root.hide(); }
+                return accept;
+            }
+            return reject;
+        }
+        panel-root := Rectangle {
+            width: 100%; height: 100%;
+            background: PanelColors.surface;
+            border-width: 1px; border-color: PanelColors.line; border-radius: 10px;
+            // The 1-DIP border plus 12-DIP padding puts content at (13, 13).
+            header := Rectangle {
+                x: 13px; y: 13px; width: root.inner-width; height: 30px;
+                PanelText {
+                    x: 0px; y: 0px; width: parent.width - 30px; height: 30px;
+                    text: root.panel-title; font-size: 13px; font-weight: 600;
+                }
+                PanelButton {
+                    x: parent.width - 30px; y: 0px; width: 30px; height: 30px;
+                    text: "\u{E721}"; icon: true; text-size: 14px; pad-x: 0px; pad-y: 0px;
+                    activated => { root.open-search(); }
+                }
+            }
+
+            text-card := Rectangle {
+                visible: !root.is-board && root.text-card-shown;
+                x: 13px; y: 51px; width: root.inner-width;
+                height: root.preview-height + 41px;
+                border-radius: 8px; background: PanelColors.raised;
+                text-preview := PanelText {
+                    x: 10px; y: 10px; width: parent.width - 20px; height: root.preview-height;
+                    text: root.context-text; font-size: 12px; wrap: word-wrap; vertical-alignment: top;
+                }
+                PanelText {
+                    x: 10px; y: 16px + root.preview-height; width: parent.width - 20px; height: 15px;
+                    text: root.context-meta; font-size: 11px; color: PanelColors.muted;
+                }
+            }
+            if !root.is-board && root.context-kind == "folder": Rectangle {
+                x: 13px; y: 51px; width: root.inner-width; height: root.folder-height - 8px;
+                PanelText { x: 4px; y: 0px; width: parent.width - 8px; height: 15px;
+                    text: "所选文件夹"; font-size: 11px; color: PanelColors.muted; }
+                for item[index] in root.context-items: Rectangle {
+                    visible: index < 3;
+                    x: 4px; y: 24px + index * 24px; width: parent.width - 8px; height: 18px;
+                    PanelGlyph { x: 0px; y: 0px; width: 26px; height: 18px; text: "\u{E8B7}"; }
+                    PanelText { x: 26px; y: 0px; width: parent.width - 26px; height: 18px; text: item; }
+                }
+                if root.overflow-label != "": PanelText {
+                    x: 30px; y: 25px + root.shown-items * 24px; width: parent.width - 30px; height: 15px;
+                    text: root.overflow-label; font-size: 11px; color: PanelColors.muted;
+                }
+                Rectangle { x: 0px; y: parent.height - 1px; width: 100%; height: 1px; background: PanelColors.line; }
+            }
+            if !root.is-board && root.context-kind == "explorer": Rectangle {
+                x: 13px; y: 51px; width: root.inner-width; height: 76px;
+                border-radius: 8px; background: PanelColors.raised;
+                PanelGlyph { x: 10px; y: 10px; width: 32px; height: 56px; text: "\u{E8B7}"; font-size: 22px; horizontal-alignment: left; }
+                PanelText { x: 42px; y: 10px; width: parent.width - 52px; height: 15px;
+                    text: "正在浏览的目录 · 未选择项目"; font-size: 11px; color: PanelColors.muted; }
+                PanelText { x: 42px; y: 30px; width: parent.width - 52px; height: 18px;
+                    text: root.context-name; font-size: 13px; font-weight: 600; }
+                PanelText { x: 42px; y: 51px; width: parent.width - 52px; height: 15px;
+                    text: root.context-path; font-size: 11px; color: PanelColors.muted; }
+            }
+
+            consent-card := Rectangle {
+                visible: !root.is-board && root.consent-visible;
+                x: 13px; y: 51px + root.context-head-height; width: root.inner-width;
+                height: root.quick-height - 10px; border-radius: 8px; background: PanelColors.raised;
+                consent-heading := PanelText {
+                    x: 10px; y: 10px; width: parent.width - 20px; height: self.preferred-height;
+                    text: "确认发送至当前共享 AI 服务？"; font-size: 12px; font-weight: 600; wrap: word-wrap;
+                }
+                consent-source-label := PanelText {
+                    x: 10px; y: 16px + consent-heading.height; width: parent.width - 20px; height: self.preferred-height;
+                    text: root.consent-source; font-size: 11px; color: PanelColors.muted; wrap: word-wrap;
+                }
+                PanelScroll {
+                    x: 10px; y: 22px + consent-heading.height + consent-source-label.height;
+                    width: parent.width - 20px; height: root.quick-body-height; body-height: consent-body.preferred-height;
+                    reserve-scrollbar: true;
+                    consent-body := PanelText { x: 0px; y: 0px; width: root.inner-width - 28px;
+                        height: self.preferred-height; text: root.consent-preview; font-size: 11px; wrap: word-wrap; vertical-alignment: top; }
+                }
+                PanelButton {
+                    x: parent.width - approve.width - self.width - 16px; y: parent.height - 38px;
+                    text: "取消"; pad-x: 10px; pad-y: 5px; height: 28px;
+                    activated => { root.consent-visible = false; root.consent-cancelled(); }
+                }
+                approve := PanelButton {
+                    x: parent.width - self.width - 10px; y: parent.height - 38px;
+                    text: "确认发送"; pad-x: 10px; pad-y: 5px; height: 28px; selected: true;
+                    activated => { root.consent-approved(); }
+                }
+            }
+            result-card := Rectangle {
+                visible: !root.is-board && root.show-result;
+                x: 13px; y: 51px + root.context-head-height; width: root.inner-width;
+                height: root.quick-height - 10px; border-radius: 8px; background: PanelColors.raised;
+                PanelText {
+                    x: 10px; y: 10px; width: parent.width - 20px - (root.result-cancel-visible ? cancel-result.width + 4px : 0px);
+                    height: root.result-cancel-visible ? 22px : 15px;
+                    text: root.result-source; font-size: 11px; color: PanelColors.muted;
+                }
+                cancel-result := PanelButton {
+                    visible: root.result-cancel-visible;
+                    x: parent.width - self.width - 10px; y: 10px; text: "取消"; text-size: 11px;
+                    pad-x: 6px; pad-y: 2px; height: 22px;
+                    activated => { root.result-visible = false; root.close-result(); }
+                }
+                PanelScroll {
+                    x: 10px; y: root.result-cancel-visible ? 38px : 31px; width: parent.width - 20px;
+                    height: root.quick-body-height; body-height: max(self.height, result-body-label.preferred-height);
+                    reserve-scrollbar: true;
+                    result-body-label := PanelText {
+                        x: 0px; y: 0px; width: root.inner-width - 28px; height: max(self.preferred-height, root.quick-body-height);
+                        text: root.result-body; font-size: 12px; wrap: word-wrap; vertical-alignment: top;
+                    }
+                }
+            }
+            if !root.is-board && root.actions.length > 0: PanelText {
+                x: 17px; y: 51px + root.context-head-height + root.quick-height;
+                width: root.inner-width - 8px; height: 15px;
+                text: "可用操作"; font-size: 11px; color: PanelColors.muted;
+            }
+            if !root.is-board: PanelScroll {
+                x: 13px; y: 51px + root.context-head-height + root.quick-height + root.action-label-height;
+                width: root.inner-width; height: root.actions-height; body-height: root.actions.length * 40px;
+                for action[index] in root.actions: Rectangle {
+                    x: 2px; y: index * 40px + 2px; width: root.inner-width - 4px; height: 36px; border-radius: 8px;
+                    border-width: 1px; border-color: transparent;
+                    opacity: index >= root.action-enabled.length || root.action-enabled[index] ? 1 : 0.45;
+                    background: root.selected-action == index || action-hit.pressed ? PanelColors.selected :
+                        (action-hit.has-hover ? PanelColors.hover : transparent);
+                    PanelIcon {
+                        x: 7px; y: 5px;
+                        glyph: index < root.action-glyphs.length ? root.action-glyphs[index] : "\u{E8A5}";
+                        has-image: index < root.action-has-images.length && root.action-has-images[index];
+                        image: root.action-images[index];
+                    }
+                    PanelText { x: 43px; y: 5px; width: parent.width - 50px; height: 26px; text: action.title; }
+                    action-hit := TouchArea {
+                        width: 100%; height: 100%; mouse-cursor: pointer;
+                        enabled: index >= root.action-enabled.length || root.action-enabled[index];
+                        clicked => { root.selected-action = index; root.action-chosen(index); }
+                    }
+                }
+                if root.actions.length == 0: PanelText {
+                    x: 4px; y: 10px; width: root.inner-width - 8px; height: 16px;
+                    text: "暂无适配功能"; font-size: 12px; color: PanelColors.muted;
+                }
+            }
+            if !root.is-board && root.context-kind == "files": Rectangle {
+                x: 13px; y: 51px + root.context-head-height + root.quick-height + root.action-label-height + root.actions-height + 8px;
+                width: root.inner-width; height: root.files-height - 8px;
+                Rectangle { x: 0px; y: 0px; width: 100%; height: 1px; background: PanelColors.line; }
+                PanelGlyph { x: 4px; y: 11px; width: 16px; height: 18px; text: "\u{E8A5}"; }
+                PanelText {
+                    x: 28px; y: 11px; width: parent.width - 32px; height: 18px;
+                    text: root.context-meta == "" ? "选中的文件 \{root.context-items.length} 个" : root.context-meta;
+                    font-size: 12px; font-weight: 600;
+                }
+                for item[index] in root.context-items: PanelText {
+                    visible: index < 3; x: 4px; y: 36px + index * 19px; width: root.inner-width - 8px; height: 15px;
+                    text: item; font-size: 11px; color: PanelColors.muted;
+                }
+                if root.overflow-label != "": PanelText {
+                    x: 4px; y: 38px + root.shown-items * 19px; width: parent.width - 8px; height: 15px;
+                    text: root.overflow-label; font-size: 11px; color: PanelColors.muted;
+                }
+            }
+            notice-label := PanelText {
+                visible: root.notice != "";
+                x: 13px; y: root.is-board ? 51px : 51px + root.context-height;
+                width: root.inner-width; height: self.preferred-height;
+                text: root.notice; font-size: 11px; color: PanelColors.muted; wrap: word-wrap;
+            }
+
+            if root.is-board: Rectangle {
+                x: 13px; y: 51px + root.notice-height; width: root.inner-width; height: root.board-height;
+                if !root.chooser-visible: Rectangle {
+                    x: 0px; y: 0px; width: 100%; height: 100%;
+                    for tile[index] in root.board: Rectangle {
+                        visible: index < 9;
+                        x: mod(index, 3) * (root.tile-side + 4px) + 2px;
+                        y: floor(index / 3) * (root.tile-side + 4px) + 2px;
+                        width: root.tile-side; height: root.tile-side; border-radius: 8px;
+                        border-width: 1px; border-color: transparent;
+                        background: root.selected-board == index || tile-hit.pressed ? PanelColors.selected :
+                            (tile-hit.has-hover ? PanelColors.hover : transparent);
+                        opacity: index >= root.board-enabled.length || root.board-enabled[index] ? 1 : 0.45;
+                        PanelIcon {
+                            x: (parent.width - 26px) / 2; y: (parent.height - 30px - tile-label.height) / 2;
+                            glyph: index < root.board-glyphs.length ? root.board-glyphs[index] : "\u{E8A5}";
+                            has-image: index < root.board-has-images.length && root.board-has-images[index];
+                            image: root.board-images[index];
+                        }
+                        tile-label := Rectangle {
+                            x: 7px; width: max(0px, parent.width - 14px);
+                            height: 28px;
+                            y: (parent.height - 30px - self.height) / 2 + 30px;
+                            clip: true;
+                            // Segoe UI's fallback line box is slightly taller than
+                            // WPF's explicit 14-DIP line height. Remove outer leading
+                            // while keeping two complete glyph rows inside 28 DIPs.
+                            PanelText {
+                                x: 0px; y: -2px; width: 100%; height: 32px;
+                                text: tile.title; font-size: 11px; wrap: char-wrap;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        tile-hit := TouchArea {
+                            width: 100%; height: 100%; mouse-cursor: pointer;
+                            enabled: index >= root.board-enabled.length || root.board-enabled[index];
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                                    root.board-menu-index = index;
+                                    root.board-menu-x = clamp(13px + 2px + mod(index, 3) * (root.tile-side + 4px) + self.mouse-x, 2px, root.width - 154px);
+                                    root.board-menu-y = clamp(51px + root.notice-height + 2px + floor(index / 3) * (root.tile-side + 4px) + self.mouse-y, 2px, root.height - 100px);
+                                    root.board-menu-visible = true;
+                                } else if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                                    root.drag-board-index = index; root.drag-board-target = index;
+                                    root.drag-board-active = false; root.board-click-suppressed = false;
+                                } else if event.kind == PointerEventKind.move && root.drag-board-index == index && self.pressed {
+                                    if abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px {
+                                        root.drag-board-active = true;
+                                    }
+                                } else if event.kind == PointerEventKind.up && event.button == PointerEventButton.left && root.drag-board-index >= 0 {
+                                    if root.drag-board-active {
+                                        root.board-reorder(root.drag-board-index, root.drag-board-target);
+                                        root.board-click-suppressed = true;
+                                    }
+                                    root.drag-board-index = -1; root.drag-board-target = -1; root.drag-board-active = false;
+                                }
+                            }
+                            changed has-hover => {
+                                if self.has-hover && root.drag-board-active { root.drag-board-target = index; }
+                            }
+                            clicked => {
+                                if !root.board-click-suppressed {
+                                    root.selected-board = index; root.board-chosen(index);
+                                } else { root.board-click-suppressed = false; }
+                            }
+                        }
+                    }
+                    if root.board.length == 0: PanelText {
+                        x: 0px; y: 0px; width: 100%; height: root.grid-side;
+                        text: "添加常用功能到快捷面板"; font-size: 12px; color: PanelColors.muted; horizontal-alignment: center;
+                    }
+                    Rectangle {
+                        x: 0px; y: root.grid-side; width: 100%; height: 36px;
+                        if root.add-shortcut-visible: PanelButton {
+                            x: 0px; y: 3px; text: "＋ 添加"; pad-x: 8px; pad-y: 4px;
+                            activated => { root.chooser-visible = true; root.board-add(); }
+                        }
+                        if root.pages > 1: Rectangle {
+                            x: 0px; y: 3px; width: 100%; height: 30px;
+                            previous := PanelButton {
+                                x: page.x - 34px; y: 0px; width: 28px; text: "‹"; pad-x: 4px; pad-y: 4px;
+                                enabled: root.previous-page-enabled; activated => { root.board-page(-1); }
+                            }
+                            page := PanelText {
+                                x: next-page.x - self.width - 6px; y: 0px; width: self.preferred-width; height: 30px;
+                                text: root.page-label; font-size: 11px; color: PanelColors.muted;
+                            }
+                            next-page := PanelButton {
+                                x: parent.width - 28px; y: 0px; width: 28px; text: "›"; pad-x: 4px; pad-y: 4px;
+                                enabled: root.next-page-enabled; activated => { root.board-page(1); }
+                            }
+                        }
+                    }
+                }
+                if root.chooser-visible: Rectangle {
+                    x: 0px; y: 0px; width: 100%; height: 100%;
+                    PanelText { x: 0px; y: 0px; width: parent.width - back.width; height: 32px; text: "添加快捷功能"; font-size: 12px; }
+                    back := PanelButton { x: parent.width - self.width; y: 2px; text: "返回"; pad-x: 8px; pad-y: 4px;
+                        activated => { root.chooser-visible = false; } }
+                    PanelScroll {
+                        x: 0px; y: 32px; width: 100%; height: parent.height - 32px; body-height: root.chooser-items.length * 54px;
+                        for item[index] in root.chooser-items: Rectangle {
+                            x: 2px; y: index * 54px + 2px; width: root.inner-width - 4px; height: 50px;
+                            border-radius: 8px; border-width: 1px; border-color: transparent;
+                            background: choice-hit.pressed ? PanelColors.selected :
+                                (choice-hit.has-hover ? PanelColors.hover : transparent);
+                            PanelText { x: 9px; y: 9px; width: parent.width - 18px; height: 18px; text: item.title; }
+                            PanelText { x: 9px; y: 27px; width: parent.width - 18px; height: 15px;
+                                text: item.hint; font-size: 11px; color: PanelColors.muted; }
+                            choice-hit := TouchArea { width: 100%; height: 100%; mouse-cursor: pointer;
+                                clicked => { root.chooser-chosen(index); root.chooser-visible = false; } }
+                        }
+                        if root.chooser-items.length == 0: PanelText {
+                            x: 8px; y: 16px; width: root.inner-width - 16px; height: 16px;
+                            text: "暂无可添加的通用功能"; font-size: 12px; color: PanelColors.muted;
+                        }
+                    }
+                }
+            }
+            status-label := PanelText {
+                visible: root.status-text != "";
+                x: 15px; y: 59px + (root.is-board ? root.board-height : root.context-height) + root.notice-height;
+                width: root.inner-width - 4px; height: self.preferred-height;
+                text: root.status-text; font-size: 11px; color: PanelColors.muted; wrap: word-wrap;
+            }
+            if root.board-menu-visible: Rectangle {
+                x: 0px; y: 0px; width: 100%; height: 100%; background: transparent;
+                TouchArea { width: 100%; height: 100%; clicked => { root.board-menu-visible = false; } }
+            }
+            if root.board-menu-visible: Rectangle {
+                x: root.board-menu-x; y: root.board-menu-y; width: 152px; height: 96px;
+                border-radius: 8px; border-width: 1px; border-color: PanelColors.line;
+                background: PanelColors.raised;
+                for menu-item[index] in ["移除快捷方式", "向前移动", "向后移动"]: Rectangle {
+                    x: 4px; y: 4px + index * 29px; width: parent.width - 8px; height: 28px;
+                    border-radius: 6px;
+                    background: menu-hit.pressed ? PanelColors.selected : (menu-hit.has-hover ? PanelColors.hover : transparent);
+                    PanelText { x: 10px; y: 0px; width: parent.width - 20px; height: 100%; text: menu-item; font-size: 12px; }
+                    menu-hit := TouchArea {
+                        width: 100%; height: 100%; mouse-cursor: pointer;
+                        clicked => { root.board-menu-visible = false; root.board-context-action(root.board-menu-index, index); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,14 @@
+// Colors copied from WPF LauncherThemePalette, shared by both native surfaces.
+export global HostTheme {
+    in-out property <bool> light: false;
+    out property <color> surface: light ? #ffffff : #18191b;
+    out property <color> raised: light ? #f7f9fb : #202124;
+    out property <color> line: light ? #d6dee7 : #2c2d30;
+    out property <color> text: light ? #1b2633 : #f4f4f5;
+    out property <color> muted: light ? #5f6f80 : #a1a1aa;
+    out property <color> quiet: light ? #8491a0 : #85858d;
+    out property <color> accent: light ? #2868b2 : #e4e4e7;
+    out property <color> accent-soft: light ? #e7f0fb : #27282b;
+    out property <color> hover: light ? #edf2f7 : #242528;
+    out property <color> selected: light ? #e2edf9 : #2b2c30;
+}

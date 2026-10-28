@@ -1,0 +1,113 @@
+import { HostTheme } from "theme.slint";
+import { VisualRow } from "launcher-models.slint";
+
+component ShortcutCard inherits Rectangle {
+    in property <VisualRow> item;
+    callback chosen();
+    width: 127px; height: 54px;
+    border-radius: 8px; border-width: 1px;
+    border-color: hit.has-hover ? transparent : HostTheme.line;
+    background: hit.has-hover ? HostTheme.hover : HostTheme.surface;
+    accessible-role: button;
+    accessible-label: item.title;
+    Rectangle {
+        x: 8px; y: 12px; width: 30px; height: 30px;
+        border-radius: 8px; border-width: 1px; border-color: HostTheme.line;
+        background: HostTheme.accent-soft; clip: true;
+        if root.item.has-icon: Image {
+            x: 1px; y: 1px; width: 28px; height: 28px;
+            source: root.item.icon; image-fit: contain;
+        }
+        if !root.item.has-icon && root.item.icon-token != "": Image {
+            x: 6px; y: 6px; width: 18px; height: 18px;
+            source: root.item.icon-token == "translate" ? @image-url("assets/translate-outline.svg") : @image-url("assets/plugin-outline.svg");
+            colorize: HostTheme.accent; image-fit: contain;
+        }
+        if !root.item.has-icon && root.item.icon-token == "": Text {
+            width: 100%; height: 100%; text: root.item.glyph;
+            font-size: 11px; font-weight: 600; color: HostTheme.accent;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+    Text {
+        x: 47px; y: 0px; width: 70px; height: 100%;
+        text: root.item.title; font-size: 11px; color: HostTheme.text;
+        vertical-alignment: center; overflow: elide;
+    }
+    hit := TouchArea {
+        width: 100%; height: 100%; mouse-cursor: pointer;
+        clicked => { root.chosen(); }
+    }
+}
+
+export component ShortcutSections inherits Rectangle {
+    in property <[VisualRow]> websites;
+    in property <[VisualRow]> plugins;
+    in-out property <bool> websites-expanded: false;
+    out property <length> website-height: websites-expanded ? clamp(ceil(websites.length / 6), 1, 4) * 60px : 60px;
+    callback website-chosen(int);
+    callback plugin-chosen(int);
+    background: transparent;
+    Text {
+        x: 0px; y: 0px; width: parent.width - 60px; height: 18px; text: "收藏网址"; font-size: 11px;
+        font-weight: 600; color: HostTheme.text; vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 54px; y: 0px; width: 54px; height: 18px; border-radius: 4px;
+        opacity: root.websites.length > 6 ? 1 : 0.55;
+        background: website-toggle.has-hover && root.websites.length > 6 ? HostTheme.hover : transparent;
+        Text { width: 100%; height: 100%; font-size: 10px; color: HostTheme.muted;
+            horizontal-alignment: right; vertical-alignment: center;
+            text: root.websites-expanded ? "收起 ↑" : "展开 ↓"; }
+        website-toggle := TouchArea {
+            width: 100%; height: 100%; enabled: root.websites.length > 6; mouse-cursor: pointer;
+            clicked => { root.websites-expanded = !root.websites-expanded; sites.content-y = 0px; }
+        }
+    }
+    sites := Flickable {
+        y: 23px; width: 100%; height: root.website-height;
+        content-width: self.width;
+        content-height: root.websites-expanded ? ceil(root.websites.length / 6) * 60px : 60px;
+        mouse-drag-pan-enabled: false;
+        for row[index] in root.websites: ShortcutCard {
+            x: Math.mod(index, 6) * 133px; y: floor(index / 6) * 60px;
+            item: row; chosen => { root.website-chosen(index); }
+        }
+        if root.websites.length == 0: Text {
+            x: 0px; y: 4px; width: parent.width; height: 18px; text: "收藏的网址会显示在这里";
+            font-size: 10px; color: HostTheme.quiet;
+        }
+    }
+    if root.websites-expanded && sites.content-height > sites.height: Rectangle {
+        x: parent.width - 8px; y: 23px - sites.content-y / sites.content-height * sites.height;
+        width: 8px; height: max(24px, sites.height * sites.height / sites.content-height);
+        background: transparent;
+        in-out property <length> drag-origin;
+        Rectangle { x: 2px; width: 4px; height: 100%; border-radius: 3px; background: HostTheme.quiet; }
+        thumb := TouchArea {
+            width: 100%; height: 100%; mouse-cursor: pointer;
+            pointer-event(event) => { if event.kind == PointerEventKind.down { parent.drag-origin = sites.content-y; } }
+            moved => { if self.pressed {
+                sites.content-y = clamp(parent.drag-origin - (self.mouse-y - self.pressed-y) * sites.content-height / sites.height, sites.height - sites.content-height, 0px);
+            } }
+        }
+    }
+    Text {
+        x: 0px; y: 33px + root.website-height; width: parent.width - 60px; height: 18px; text: "插件";
+        font-size: 11px; font-weight: 600; color: HostTheme.text; vertical-alignment: center;
+    }
+    Text {
+        x: parent.width - 54px; y: 33px + root.website-height; width: 54px; height: 18px;
+        text: "展开 ↓"; font-size: 10px; color: HostTheme.muted; opacity: 0.55;
+        horizontal-alignment: right; vertical-alignment: center;
+    }
+    Rectangle {
+        y: 56px + root.website-height; width: 100%; height: 60px; background: transparent;
+        for row[index] in root.plugins: ShortcutCard {
+            x: index * 133px; y: 0px; item: row; chosen => { root.plugin-chosen(index); }
+        }
+        if root.plugins.length == 0: Text {
+            x: 0px; y: 4px; width: parent.width; height: 18px; text: "暂无可显示的插件功能"; font-size: 10px; color: HostTheme.quiet;
+        }
+    }
+}

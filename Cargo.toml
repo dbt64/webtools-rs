@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["prototype/slint-launcher", "crates/webtools-ipc"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

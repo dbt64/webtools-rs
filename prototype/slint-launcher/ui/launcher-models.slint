@@ -1,0 +1,15 @@
+export struct HighlightPart {
+    text: string,
+    highlighted: bool,
+}
+
+export struct VisualRow {
+    title: string,
+    title-parts: [HighlightPart],
+    subtitle: string,
+    icon-index: int,
+    has-icon: bool,
+    icon: image,
+    glyph: string,
+    icon-token: string,
+}

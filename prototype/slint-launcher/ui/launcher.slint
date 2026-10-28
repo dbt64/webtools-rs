@@ -1,0 +1,498 @@
+export { HostTheme } from "theme.slint";
+import { HostTheme } from "theme.slint";
+import { FixtureIcons } from "fixture-icons.slint";
+import { VisualRow, HighlightPart } from "launcher-models.slint";
+import { ShortcutSections } from "launcher-shortcuts.slint";
+import { LineEdit, Button, ListView, ScrollView } from "std-widgets.slint";
+
+component HighlightedTitle inherits Rectangle {
+    in property <string> title;
+    in property <[HighlightPart]> parts;
+    in property <length> text-size: 14px;
+    in property <int> text-weight: 500;
+    in property <brush> row-background: HostTheme.surface;
+    background: transparent;
+
+    if root.parts.length == 0: Text {
+        width: 100%; height: 100%; text: root.title;
+        color: HostTheme.text; font-size: root.text-size; font-weight: root.text-weight;
+        overflow: elide;
+    }
+    if root.parts.length > 0: Rectangle {
+        width: 100%; height: 100%; clip: true; background: transparent;
+        line := HorizontalLayout {
+            x: 0px; y: 0px; width: self.preferred-width; height: parent.height; spacing: 0px;
+            for part in root.parts: Text {
+                text: part.text; color: part.highlighted ? #F18325 : HostTheme.text;
+                font-size: root.text-size; font-weight: root.text-weight;
+            }
+        }
+        if line.preferred-width > root.width: Rectangle {
+            x: parent.width - 16px; width: 16px; height: parent.height;
+            background: root.row-background;
+            Text { width: 100%; height: 100%; text: "…"; color: HostTheme.text;
+                font-size: root.text-size; font-weight: root.text-weight; }
+        }
+    }
+}
+
+export component Launcher inherits Window {
+    title: "WebTools Slint · Stage 2 fixture";
+    width: 850px;
+    height: 550px;
+    background: #181b22;
+    default-font-family: "Microsoft YaHei UI";
+    in-out property <string> query;
+    in property <[string]> rows;
+    in property <[image]> row-icons;
+    in-out property <int> selected: -1;
+    in-out property <string> status: "247 fixed entries · text only · no external actions";
+    out property <bool> input-focused: input.has-focus;
+    callback query-edited(string);
+    callback dismiss();
+    callback move-selection(int);
+    callback choose();
+    public function focus-input() { input.focus(); }
+    forward-focus: input;
+    VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+        Text { text: "WEBTOOLS  /  SLINT EXPERIMENT"; color: #899bb6; font-size: 13px; }
+        input := LineEdit {
+            text <=> root.query;
+            placeholder-text: "输入 App、alpha-001 或记事本";
+            edited(text) => { root.query-edited(text); }
+            accepted => { root.choose(); }
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.dismiss(); return accept; }
+                if event.text == Key.DownArrow { root.move-selection(1); return accept; }
+                if event.text == Key.UpArrow { root.move-selection(-1); return accept; }
+                return reject;
+            }
+        }
+        ListView {
+            for row[index] in root.rows: Rectangle {
+                height: 40px;
+                background: index == root.selected ? #2d405c : #202631;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 10px;
+                    Image {
+                        width: 24px;
+                        height: 24px;
+                        source: root.row-icons[index];
+                        image-fit: contain;
+                    }
+                    Text { text: row; color: #e5eaf1; vertical-alignment: center; }
+                }
+                TouchArea { clicked => { root.selected = index; root.choose(); } }
+            }
+        }
+        Text { text: root.status; color: #aab5c5; font-size: 12px; wrap: word-wrap; }
+        HorizontalLayout {
+            Button { text: "清空"; clicked => { root.query = ""; root.query-edited(""); input.focus(); } }
+            Button { text: "隐藏（Ctrl+Alt+Shift+F11 唤回）"; clicked => { root.dismiss(); } }
+        }
+    }
+}
+export component Panel inherits Window {
+    title: "WebTools Super Panel";
+    width: 420px;
+    height: 140px;
+    background: #202631;
+    Text { text: "Super Panel · 选区动作"; color: #e5eaf1; font-size: 14px; }
+    Text { y: 28px; text: "NOACTIVATE probe"; color: #899bb6; font-size: 12px; }
+}
+export { VisualRow, HighlightPart } from "launcher-models.slint";
+// Production geometry: transparent outer margins and footer, opaque inner card.
+export component Baseline inherits Window {
+    title: "WebTools Launcher Replica";
+    no-frame: true;
+    width: 850px;
+    height: plugin-loading ? 128px : (query != "" ? 466px : (expanded ? 266px + (websites-expanded ? clamp(ceil(website-shortcuts.length / 6), 1, 4) * 60px : 60px) : 128px));
+
+    background: transparent;
+    default-font-family: "Segoe UI Variable Text";
+    default-font-size: 14px;
+    in-out property <string> query;
+    in-out property <bool> expanded: false;
+    in-out property <int> selected: -1;
+    in property <[VisualRow]> rows;
+    in property <string> status;
+    in property <string> connection-status: "";
+    in property <bool> plugin-loading: false;
+    property <int> plugin-loading-frame: 0;
+    in property <bool> acrylic: false;
+    in property <bool> result-visible: false;
+    in property <string> result-source: "";
+    in property <string> result-body: "";
+    in property <bool> fixture-icons: true;
+    in property <[VisualRow]> website-shortcuts;
+    in property <[VisualRow]> plugin-shortcuts;
+    in-out property <bool> websites-expanded: false;
+    in-out property <bool> file-search-mode: false;
+    in property <[string]> file-categories;
+    in-out property <int> file-category-selected: 0;
+    in-out property <bool> file-category-focused: false;
+    in property <string> file-engine-source: "";
+    in-out property <bool> file-menu-visible: false;
+    in-out property <int> file-menu-action: 0;
+    in-out property <bool> file-selected-is-folder: false;
+    in-out property <length> file-menu-x: 520px;
+    in-out property <length> file-menu-y: 120px;
+    callback query-edited(string);
+    callback submit();
+    callback dismiss();
+    callback move-selection(int);
+    callback drag-window();
+    callback translate();
+    callback open-manager();
+    callback close-result();
+    callback copy-result();
+    callback refresh-shortcuts();
+    callback website-shortcut-chosen(int);
+    callback plugin-shortcut-chosen(int);
+    callback file-category-chosen(int);
+    callback file-context-requested(int);
+    callback file-operation-chosen(int);
+    public function focus-input() { input.focus(); }
+    public function focus-input-at-end(byte-offset: int) { input.focus(); input.set-selection-offsets(byte-offset, byte-offset); }
+    Timer {
+        interval: 80ms;
+        running: root.plugin-loading;
+        triggered => { root.plugin-loading-frame = root.plugin-loading-frame == 11 ? 0 : root.plugin-loading-frame + 1; }
+    }
+    forward-focus: keys;
+    keys := FocusScope {
+        width: 100%; height: 100%;
+        forward-focus: input;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.result-visible { root.close-result(); } else { root.dismiss(); }
+                return accept;
+            }
+            if event.text == Key.DownArrow { root.move-selection(1); return accept; }
+            if event.text == Key.UpArrow { root.move-selection(-1); return accept; }
+            if event.modifiers.control && event.text == Key.Return { root.translate(); return accept; }
+            return reject;
+        }
+        Rectangle {
+            x: 10px; y: 12px; width: 830px; height: root.height - 50px;
+            border-radius: 11px;
+            border-width: 1px; border-color: HostTheme.line;
+            background: root.acrylic ? (HostTheme.light ? #ffffffe6 : #18191be6) : HostTheme.surface;
+            drop-shadow-color: #00000035;
+            drop-shadow-blur: 8px; drop-shadow-offset-y: 2px;
+        }
+        // The background is draggable; interactive controls above it keep their input.
+        TouchArea {
+            x: 10px; y: 0px; width: 830px; height: root.height;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down && event.button == PointerEventButton.left { root.drag-window(); }
+            }
+        }
+        Text {
+            x: 36px; y: 13px; width: 25px; height: 76px;
+            text: "⌕"; font-size: 25px; font-family: "Segoe UI Symbol";
+            color: HostTheme.muted; vertical-alignment: center;
+        }
+        input := TextInput {
+            x: 70px; y: 13px; width: 696px; height: 76px;
+            font-size: 19px; color: HostTheme.text; font-family: "Microsoft YaHei UI";
+            single-line: true; vertical-alignment: center;
+            selection-background-color: HostTheme.accent-soft; selection-foreground-color: HostTheme.text;
+            text <=> root.query;
+            key-pressed(event) => {
+                if root.file-search-mode && root.file-menu-visible {
+                    if event.text == Key.Escape { root.file-menu-visible = false; return accept; }
+                    if event.text == Key.UpArrow {
+                        root.file-menu-action = max(0, root.file-menu-action - 1);
+                        return accept;
+                    }
+                    if event.text == Key.DownArrow {
+                        root.file-menu-action = min(4, root.file-menu-action + 1);
+                        return accept;
+                    }
+                    if event.text == Key.Return {
+                        root.file-menu-visible = false;
+                        root.file-operation-chosen(root.file-menu-action);
+                        return accept;
+                    }
+                }
+                if root.file-search-mode && root.file-category-focused {
+                    if event.text == Key.DownArrow && root.file-categories.length > 0 {
+                        root.file-category-selected = root.file-category-selected + 1 < root.file-categories.length ? root.file-category-selected + 1 : 0;
+                        root.file-category-chosen(root.file-category-selected);
+                        return accept;
+                    }
+                    if event.text == Key.UpArrow && root.file-categories.length > 0 {
+                        root.file-category-selected = root.file-category-selected > 0 ? root.file-category-selected - 1 : root.file-categories.length - 1;
+                        root.file-category-chosen(root.file-category-selected);
+                        return accept;
+                    }
+                    if event.text == Key.Return {
+                        root.file-category-focused = false;
+                        return accept;
+                    }
+                }
+                if root.file-search-mode && root.rows.length > 0
+                    && event.modifiers.shift && event.text == Key.F10 {
+                    root.file-context-requested(root.selected);
+                    return accept;
+                }
+                if event.text == Key.Escape { root.dismiss(); return accept; }
+                if event.text == Key.DownArrow { root.move-selection(1); return accept; }
+                if event.text == Key.UpArrow { root.move-selection(-1); return accept; }
+                return reject;
+            }
+            edited => { root.query-edited(self.text); }
+            accepted => { root.submit(); }
+        }
+        // `query` contains committed text only. While an IME is composing,
+        // the pre-edit text is separate and the placeholder must stay hidden.
+        if root.query == "" && input.preedit-text == "": Text {
+            x: 70px; y: 13px; width: 696px; height: 76px;
+            text: "搜索应用，输入 ? 搜索网页";
+            font-size: 19px; color: HostTheme.light ? HostTheme.muted : #7C7C84; font-family: "Microsoft YaHei UI"; vertical-alignment: center;
+        }
+        // Clicking an empty search field focuses it; dragging it moves the window.
+        if root.query == "" && input.preedit-text == "": TouchArea {
+            x: 70px; y: 13px; width: 696px; height: 76px;
+            mouse-cursor: text;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                    input.focus();
+                    root.drag-window();
+                }
+            }
+        }
+        Rectangle {
+            x: 786px; y: 31px; width: 40px; height: 40px;
+            border-radius: 11px; background: #000000;
+            Image { x: 5px; y: 5px; width: 30px; height: 30px;
+                source: @image-url("assets/logo-mark.svg"); image-fit: contain; }
+            TouchArea {
+                width: 100%; height: 100%; mouse-cursor: pointer;
+                clicked => { root.open-manager(); }
+            }
+        }
+        if root.plugin-loading: Image {
+            x: 781px; y: 26px; width: 50px; height: 50px;
+            source: @image-url("assets/loading-ring-frames.png");
+            image-fit: contain;
+            source-clip-x: root.plugin-loading-frame * 100;
+            source-clip-width: 100;
+            source-clip-height: 100;
+        }
+        if !root.plugin-loading && root.query != "" && root.file-search-mode: Rectangle {
+            x: 13px; y: 91px; width: 819px; height: root.height - 129px;
+            background: transparent;
+            Rectangle {
+                x: 0px; y: 0px; width: 154px; height: parent.height;
+                Text { x: 14px; y: 10px; width: 125px; height: 17px;
+                    text: "文件类型"; color: HostTheme.muted; font-size: 10px; font-weight: 600; }
+                for category[index] in root.file-categories: Rectangle {
+                    x: 10px; y: 34px + index * 35px; width: 128px; height: 32px;
+                    border-radius: 6px;
+                    border-width: root.file-category-focused && root.file-category-selected == index ? 1px : 0px;
+                    border-color: HostTheme.accent;
+                    background: root.file-category-selected == index ? HostTheme.selected : (category-hit.has-hover ? HostTheme.hover : transparent);
+                    Text { x: 8px; width: parent.width - 16px; height: 100%; text: category;
+                        color: HostTheme.text; font-size: 11px; vertical-alignment: center; }
+                    category-hit := TouchArea {
+                        width: 100%; height: 100%; mouse-cursor: pointer;
+                        clicked => {
+                            input.focus();
+                            root.file-category-focused = true;
+                            root.file-category-selected = index;
+                            root.file-menu-visible = false;
+                            root.file-category-chosen(index);
+                        }
+                    }
+                }
+            }
+            Rectangle { x: 154px; width: 1px; height: parent.height; background: HostTheme.line; }
+            Rectangle {
+                x: 155px; width: parent.width - 155px; height: parent.height;
+                Text { x: 14px; y: 5px; width: 240px; height: 18px;
+                    text: "文件搜索结果"; color: HostTheme.text; font-size: 11px; font-weight: 600; }
+                Text { x: 250px; y: 5px; width: parent.width - 265px; height: 18px;
+                    text: root.file-engine-source != "" ? root.file-engine-source : root.status;
+                    color: HostTheme.muted; font-size: 10px; horizontal-alignment: right; overflow: elide; }
+                if root.rows.length > 0: file-results := Flickable {
+                    x: 14px; y: 26px; width: parent.width - 24px; height: parent.height - 28px;
+                    content-width: self.width; content-height: root.rows.length * 44px;
+                    for row[index] in root.rows: Rectangle {
+                        x: 0px; y: index * 44px; width: parent.width; height: 42px;
+                        border-radius: 7px;
+                        background: root.selected == index ? HostTheme.selected : (file-row.has-hover ? HostTheme.hover : transparent);
+                        Rectangle {
+                            x: 5px; y: 4px; width: 34px; height: 34px; border-radius: 9px;
+                            background: HostTheme.accent-soft;
+                            if row.has-icon: Image { x: 3px; y: 3px; width: 28px; height: 28px; source: row.icon; image-fit: contain; }
+                            if !row.has-icon: Text {
+                                width: 100%; height: 100%;
+                                text: row.icon-index == 1 ? "📁" : (row.icon-index == 2 ? "▣" : (row.icon-index == 3 ? "▤" : (row.icon-index == 4 ? "▧" : (row.icon-index == 5 ? "▷" : (row.icon-index == 6 ? "♪" : (row.icon-index == 7 ? "▦" : "◇"))))));
+                                color: HostTheme.accent; font-family: "Segoe UI Symbol"; font-size: 16px;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        HighlightedTitle { x: 48px; y: 3px; width: parent.width - 72px; height: 18px;
+                            title: row.title; parts: row.title-parts; text-size: 12px; text-weight: 400;
+                            row-background: root.selected == index ? HostTheme.selected : (file-row.has-hover ? HostTheme.hover : HostTheme.surface); }
+                        Text { x: 48px; y: 21px; width: parent.width - 72px; height: 16px;
+                            text: row.subtitle; color: HostTheme.muted; font-size: 10px; overflow: elide; }
+                        if index == root.selected: Text { x: parent.width - 24px; width: 18px; height: parent.height;
+                            text: "↵"; color: HostTheme.muted; font-size: 15px; horizontal-alignment: center; vertical-alignment: center; }
+                        file-row := TouchArea {
+                            width: 100%; height: 100%; mouse-cursor: pointer;
+                            clicked => { root.file-category-focused = false; root.selected = index; root.file-menu-visible = false; root.submit(); }
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.down && event.button == PointerEventButton.right {
+                                    root.selected = index;
+                                    root.file-menu-action = 0;
+                                    root.file-menu-x = clamp(155px + 14px + self.mouse-x, 0px, root.width - 205px);
+                                    root.file-menu-y = clamp(26px + index * 44px - file-results.content-y + self.mouse-y, 0px, root.height - 319px);
+                                    root.file-menu-visible = true;
+                                    root.file-context-requested(index);
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.rows.length == 0: Text {
+                    x: 14px; y: 58px; width: parent.width - 28px; height: 28px;
+                    text: root.status != "" ? root.status : "没有找到匹配的文件或文件夹。";
+                    color: HostTheme.muted; font-size: 12px; vertical-alignment: center;
+                }
+            }
+            if root.file-menu-visible: TouchArea {
+                width: parent.width; height: parent.height;
+                clicked => { root.file-menu-visible = false; }
+            }
+            if root.file-menu-visible: Rectangle {
+                x: clamp(root.file-menu-x, 0px, parent.width - 205px);
+                y: clamp(root.file-menu-y, 0px, parent.height - 190px);
+                width: 198px; height: 184px; border-radius: 8px;
+                border-width: 1px; border-color: HostTheme.line; background: HostTheme.raised;
+                for label[index] in ["打开", "在文件夹中显示", "复制文件或文件夹", "复制文件路径", "复制上级文件夹路径"]: Rectangle {
+                    x: 5px; y: 5px + index * 34px; width: parent.width - 10px; height: 32px;
+                    border-radius: 6px;
+                    background: root.file-menu-action == index ? HostTheme.selected : (menu-hit.has-hover ? HostTheme.hover : transparent);
+                    Text { x: 9px; width: parent.width - 18px; height: 100%;
+                        text: index == 2 ? (root.file-selected-is-folder ? "复制文件夹" : "复制文件") : label;
+                        color: HostTheme.text; font-size: 11px; vertical-alignment: center; }
+                    menu-hit := TouchArea {
+                        width: 100%; height: 100%; mouse-cursor: pointer;
+                        clicked => {
+                            root.file-menu-visible = false;
+                        root.file-category-focused = false;
+                            root.file-operation-chosen(index);
+                        }
+                    }
+                }
+            }
+        }
+        if !root.plugin-loading && root.query != "" && !root.file-search-mode: Rectangle {
+            x: 13px; y: 91px; width: 819px; height: root.height - 129px;
+            background: transparent;
+            results := Flickable {
+            x: 0px; y: 0px;
+            width: 803px; height: parent.height;
+            mouse-drag-pan-enabled: false;
+            content-width: 803px; content-height: root.rows.length * 52px;
+            content-y: root.selected < 0 ? 0px : -max(0px, min(root.selected * 52px - (self.height - 52px), self.content-height - self.height));
+            for row[index] in root.rows: Rectangle {
+                x: 0px; y: index * 52px; width: 803px; height: 50px;
+                border-radius: 8px;
+                background: root.selected == index ? HostTheme.selected : (hit.has-hover ? HostTheme.hover : transparent);
+                Rectangle {
+                    x: 14px; y: 8px; width: 34px; height: 34px;
+                    border-radius: 9px; background: HostTheme.accent-soft;
+                    if row.has-icon: Image {
+                        x: 5px; y: 5px; width: 24px; height: 24px;
+                        source: row.icon; image-fit: contain;
+                    }
+                    if !row.has-icon && root.fixture-icons && row.icon-index >= 0: Image {
+                        x: 5px; y: 5px; width: 24px; height: 24px;
+                        source: FixtureIcons.images[row.icon-index]; image-fit: contain;
+                    }
+                    if !row.has-icon && row.icon-token != "": Image {
+                        x: 7px; y: 7px; width: 20px; height: 20px;
+                        source: row.icon-token == "translate" ? @image-url("assets/translate-outline.svg") : @image-url("assets/plugin-outline.svg");
+                        colorize: HostTheme.accent; image-fit: contain;
+                    }
+                    if !row.has-icon && row.icon-token == "" && (!root.fixture-icons || row.icon-index < 0): Text {
+                        width: 100%; height: 100%; text: row.glyph != "" ? row.glyph : "⌘";
+                        color: HostTheme.accent; font-family: "Segoe UI Symbol"; font-size: 16px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+                HighlightedTitle { x: 60px; y: 10px; height: 21px; width: 700px;
+                    title: row.title; parts: row.title-parts;
+                    row-background: root.selected == index ? HostTheme.selected : (hit.has-hover ? HostTheme.hover : HostTheme.surface); }
+                Text { x: 60px; y: 27px; height: 17px; width: 700px;
+                    text: row.subtitle; color: HostTheme.muted; font-size: 11px; overflow: elide; }
+                if index == root.selected: Text { x: 774px; width: 18px; height: 52px; text: "↵";
+                    color: HostTheme.muted; font-size: 15px; vertical-alignment: center; }
+                hit := TouchArea { width: 100%; height: 100%; clicked => { root.selected = index; root.submit(); } }
+            }
+            }
+            if results.content-height > results.height: Rectangle {
+                x: 806px; width: 13px;
+                height: max(24px, results.height * results.height / results.content-height);
+                y: -results.content-y / results.content-height * results.height;
+                background: transparent;
+                in-out property <length> drag-origin;
+                Rectangle {
+                    x: 4px; y: 0px; width: 5px; height: 100%;
+                    border-radius: 3px; background: HostTheme.quiet;
+                }
+                thumb := TouchArea {
+                    width: 100%; height: 100%; mouse-cursor: pointer;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down { parent.drag-origin = results.content-y; }
+                    }
+                    moved => {
+                        if self.pressed { results.content-y = clamp(parent.drag-origin - (self.mouse-y - self.pressed-y) * results.content-height / results.height, results.height - results.content-height, 0px); }
+                    }
+                }
+            }
+        }
+        if !root.plugin-loading && root.query == "" && root.expanded: Rectangle {
+            x: 11px; y: 88px; width: 828px; height: root.height - 139px;
+            background: transparent;
+            Rectangle { x: 0px; y: 0px; width: 100%; height: 1px; background: HostTheme.line; }
+            ShortcutSections {
+                x: 13px; y: 10px; width: 800px; height: parent.height - 10px;
+                websites: root.website-shortcuts; plugins: root.plugin-shortcuts;
+                websites-expanded <=> root.websites-expanded;
+                website-chosen(index) => { root.website-shortcut-chosen(index); }
+                plugin-chosen(index) => { root.plugin-shortcut-chosen(index); }
+            }
+        }
+        if ((root.query != "" && root.status != "") || root.connection-status != "") && !root.file-search-mode: Text {
+            x: 10px; y: root.height - 33px; height: 26px;
+            text: root.connection-status != "" ? root.connection-status : root.status;
+            color: HostTheme.muted; font-size: 10px; vertical-alignment: center;
+        }
+        Text { x: 726px; y: root.height - 36px; width: 62px; height: 26px;
+            text: "↗ WebTools"; font-size: 10px; color: HostTheme.muted; vertical-alignment: center; }
+        Rectangle {
+            x: 788px; y: root.height - 36px; width: 52px; height: 26px;
+            border-radius: 7px; border-width: 1px; border-color: HostTheme.line;
+            background: toggle.has-hover ? HostTheme.hover : HostTheme.raised;
+            Text { width: 100%; height: 100%; text: root.expanded && !root.plugin-loading ? "收起 ↑" : "展开 ↓";
+                font-size: 11px; font-weight: 600; color: HostTheme.accent;
+                horizontal-alignment: center; vertical-alignment: center; }
+            toggle := TouchArea { width: 100%; height: 100%; enabled: !root.plugin-loading; mouse-cursor: pointer; clicked => {
+                root.expanded = !root.expanded; root.websites-expanded = false;
+                if root.expanded { root.refresh-shortcuts(); }
+                input.focus();
+            } }
+        }
+    }
+}
+export { SuperPanel, PanelAction } from "panel.slint";
