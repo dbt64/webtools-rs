@@ -2,3 +2,12 @@
 /.tmp/
 /data/
 webtools-launcher.json
+/node_modules/
+/out/
+/dist/
+/release/
+**/bin/
+!plugin-sdk/create-webtools-plugin/bin/
+!plugin-sdk/create-webtools-plugin/bin/**
+**/obj/
+*.log

@@ -1,0 +1,192 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { PluginCatalog } from './plugin-catalog.ts'
+import { PluginManager } from './plugin-manager.ts'
+import { manifest, packageBytes, runtimeV3Manifest, runtimeV3Package } from './fixtures.mjs'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const summary = { id: 'webtools.translation', name: 'Untrusted Translation', version: '1.0.0', hash: 'a'.repeat(64), enabled: true, status: 'active', requested: ['manager.page'], granted: ['manager.page'], installedVersions: ['1.0.0'], source: 'local-unsigned' }
+function builtinLifecycle(initial = { status: 'ready', enabled: true, generation: 0 }) {
+  let state = structuredClone(initial)
+  return {
+    snapshot: () => structuredClone(state),
+    isEnabled: () => state.status === 'ready' && state.enabled,
+    setEnabled: async (enabled, mayCommit = () => true) => {
+      if (state.status === 'unavailable') throw Object.assign(new Error(), { code: 'STATE_UNAVAILABLE' })
+      if (!mayCommit()) throw Object.assign(new Error(), { code: 'SESSION_EXPIRED' })
+      state = enabled ? { status: 'ready', enabled: true, generation: state.generation + 1 } : { status: 'disabled', enabled: false, generation: state.generation + 1 }
+      return structuredClone(state)
+    },
+    recoverToDefault: async (confirmed, mayCommit = () => true) => {
+      if (!confirmed || !mayCommit()) throw Object.assign(new Error(), { code: 'SESSION_EXPIRED' })
+      state = { status: 'ready', enabled: true, generation: state.generation + 1 }
+      return structuredClone(state)
+    },
+  }
+}
+function setup() {
+  let session = 'core'; let rows = [summary]
+  const calls = []
+  const core = { get session() { return session }, isSession: value => value === session, list: async () => rows, getPages: async (id, value) => { calls.push([id, value]); return { pluginId: id } }, setEnabled: async (id, enabled) => ({ ...summary, id, enabled }) }
+  const builtin = builtinLifecycle()
+  const catalog = new PluginCatalog('0.1.0', () => core, builtin)
+  return { catalog, core, builtin, calls, rows: value => { rows = value }, rotate: () => { session = 'new' } }
+}
+test('installed v3 appears as a Web package and opens only through live Main authority; frozen Native projections stay unchanged', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'webtools-catalog-web-')); t.after(() => rm(root, { recursive: true, force: true }))
+  const core = new PluginManager({ userData: root, hostVersion: '0.1.0', confirm: async () => true, externalOpen: async () => {}, clipboardWrite: () => {},
+    ai: { complete: async () => ({ text: 'test' }), getDefaultProviderInfo: async () => ({ providerName: 'test', model: 'test' }) } })
+  await core.initialize(); t.after(() => core.close())
+  const m = runtimeV3Manifest(); await core.install(runtimeV3Package(m), core.session); await core.setEnabled(m.id, true, core.session)
+  let opened
+  const catalog = new PluginCatalog('0.1.0', () => core, builtinLifecycle(), async authority => { opened = authority })
+  const entry = (await catalog.list(catalog.session)).entries.find(e => e.id === m.id)
+  assert.equal(entry.kind, 'web'); assert.equal(entry.package.webFeatures[0].id, 'hello')
+  assert.equal((await catalog.open({ kind: 'web', id: m.id, featureId: 'hello' }, catalog.session)).kind, 'web')
+  assert.equal(opened.isCurrent(), true)
+  assert.equal((await catalog.launcherProjection(catalog.session)).plugins.some(p => p.ref.id === m.id), false)
+  assert.deepEqual(await core.listFeatureCandidates(), [])
+  await assert.rejects(() => catalog.open({ kind: 'web', id: m.id, featureId: 'forged' }, catalog.session))
+  await core.setEnabled(m.id, false, core.session); assert.equal(opened.isCurrent(), false)
+})
+test('bundled Translation can be disabled and re-enabled without affecting a same-ID declarative package', async () => {
+  const { catalog, calls } = setup()
+  const snapshot = await catalog.list(catalog.session)
+  assert.equal(snapshot.entries.length, 2)
+  assert.equal(snapshot.entries[0].source, 'bundled')
+  assert.equal(snapshot.entries[0].version, '0.1.0')
+  assert.deepEqual(snapshot.entries[0].management, { canToggle: true, canRecover: false, canManageGrants: false, canUninstall: false, canReplacePackage: false })
+  assert.equal(snapshot.entries[1].kind, 'declarative')
+  assert.equal(snapshot.entries[1].package.name, summary.name)
+  assert.equal((await catalog.open({ kind: 'builtin', id: summary.id }, catalog.session)).key, 'translation')
+  assert.equal(calls.length, 0)
+  assert.equal((await catalog.open({ kind: 'declarative', id: summary.id }, catalog.session)).kind, 'declarative')
+  assert.equal(calls.length, 1)
+  const disabled = await catalog.setEnabled({ kind: 'builtin', id: summary.id }, false, catalog.session)
+  assert.equal(disabled.kind, 'builtin')
+  assert.equal(disabled.state.status, 'disabled')
+  assert.equal((await catalog.list(catalog.session)).entries[0].state.enabled, false)
+  await assert.rejects(catalog.open({ kind: 'builtin', id: summary.id }, catalog.session), { code: 'PLUGIN_DISABLED' })
+  assert.equal((await catalog.open({ kind: 'declarative', id: summary.id }, catalog.session)).kind, 'declarative')
+  const enabled = await catalog.setEnabled({ kind: 'builtin', id: summary.id }, true, catalog.session)
+  assert.equal(enabled.state.status, 'ready')
+})
+test('bundled Translation dispatches to its dedicated window when the Host supplies that surface', async () => {
+  let opened = 0
+  const catalog = new PluginCatalog('0.1.0', () => null, builtinLifecycle(), undefined, undefined, async () => { opened += 1 })
+
+  const result = await catalog.open({ kind: 'builtin', id: 'webtools.translation' }, catalog.session)
+
+  assert.equal(opened, 1)
+  assert.deepEqual(result, {
+    kind: 'builtin', id: 'webtools.translation', key: 'translation', generation: 0, presentation: 'window',
+  })
+})
+test('invalid built-in state is unavailable and only explicit confirmed recovery restores the page', async () => {
+  const unavailable = { status: 'unavailable', enabled: false, errorCode: 'STATE_INVALID', generation: 0 }
+  const builtin = builtinLifecycle(unavailable)
+  const catalog = new PluginCatalog('0.1.0', () => null, builtin)
+  const entry = (await catalog.list(catalog.session)).entries[0]
+  assert.equal(entry.state.status, 'unavailable')
+  assert.equal(entry.management.canToggle, false)
+  assert.equal(entry.management.canRecover, true)
+  await assert.rejects(catalog.setEnabled({ kind: 'builtin', id: 'webtools.translation' }, true, catalog.session), { code: 'STATE_UNAVAILABLE' })
+  await assert.rejects(catalog.open({ kind: 'builtin', id: 'webtools.translation' }, catalog.session), { code: 'PLUGIN_DISABLED' })
+  await catalog.recoverBuiltinTranslation(catalog.session, true)
+  assert.equal((await catalog.list(catalog.session)).entries[0].state.status, 'ready')
+})
+test('core failure is explicit while built-in list/open remains available', async () => {
+  for (const core of [null, { session: 'core', isSession: () => true, list: async () => { throw new Error('C:/private/token') } }]) {
+    const catalog = new PluginCatalog('0.1.0', () => core, builtinLifecycle())
+    const snapshot = await catalog.list(catalog.session)
+    assert.equal(snapshot.entries.length, 1)
+    assert.equal(snapshot.declarativeAvailability.status, 'unavailable')
+    assert.equal(JSON.stringify(snapshot).includes('private'), false)
+    assert.equal((await catalog.open({ kind: 'builtin', id: summary.id }, catalog.session)).kind, 'builtin')
+    await assert.rejects(catalog.open({ kind: 'declarative', id: summary.id }, catalog.session))
+  }
+})
+test('package status is projected unchanged and list revisions increase', async () => {
+  const env = setup()
+  for (const status of ['installed-disabled', 'needs-permission', 'incompatible', 'invalid', 'invoking']) {
+    env.rows([{ ...summary, status }])
+    const a = await env.catalog.list(env.catalog.session); const b = await env.catalog.list(env.catalog.session)
+    assert.equal(a.entries[1].package.status, status)
+    assert.ok(b.revision > a.revision)
+  }
+})
+test('awaited catalog work cannot survive core reload, catalog reload or close', async () => {
+  for (const invalidate of [env => env.rotate(), env => env.catalog.beginSession(), env => env.catalog.close()]) {
+    const env = setup(); let complete
+    env.core.list = () => new Promise(resolve => { complete = resolve })
+    const pending = env.catalog.list(env.catalog.session)
+    invalidate(env); complete([summary])
+    await assert.rejects(pending, { code: 'SESSION_EXPIRED' })
+  }
+  const env = setup(); let complete
+  env.core.getPages = () => new Promise(resolve => { complete = resolve })
+  const pending = env.catalog.open({ kind: 'declarative', id: summary.id }, env.catalog.session)
+  env.catalog.beginSession(); complete({ pluginId: summary.id })
+  await assert.rejects(pending, { code: 'SESSION_EXPIRED' })
+})
+
+test('real manifest-v1 core retains grants/data and controls same-ID catalog page admission', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'webtools-5f-core-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const core = new PluginManager({ userData: root, hostVersion: '0.1.0', confirm: async () => true, externalOpen: async () => {}, clipboardWrite: () => {}, ai: { getDefaultProviderInfo: async () => { throw new Error('not used') }, complete: async () => { throw new Error('not used') } } })
+  t.after(() => core.close())
+  await core.initialize()
+  const catalog = new PluginCatalog('0.1.0', () => core, builtinLifecycle())
+  const m = manifest({ id: 'webtools.translation', name: 'Untrusted same ID' })
+  await core.install(packageBytes(m), core.session)
+  const ref = { kind: 'declarative', id: m.id }
+  await assert.rejects(catalog.open(ref, catalog.session), { code: 'PLUGIN_DISABLED' })
+  await catalog.setEnabled(ref, true, catalog.session)
+  const before = await readFile(join(root, 'plugins/registry.json'))
+  const snapshot = await catalog.list(catalog.session)
+  assert.equal(snapshot.entries[1].package.source, 'local-unsigned')
+  assert.equal((await catalog.open(ref, catalog.session)).page.pluginId, m.id)
+  assert.deepEqual(await readFile(join(root, 'plugins/registry.json')), before, 'projection does not migrate or reset registry')
+  await core.setGrants(m.id, [], core.session)
+  await assert.rejects(catalog.open(ref, catalog.session))
+  assert.equal((await catalog.open({ kind: 'builtin', id: m.id }, catalog.session)).key, 'translation')
+})
+
+test('Launcher projection exposes only launchable composite identities, names and fixed safe icons', async () => {
+  const env = setup()
+  env.rows([{ ...summary, secret: 'must-not-cross', path: 'C:/private/archive' }])
+  assert.deepEqual(await env.catalog.launcherProjection(env.catalog.session), {
+    projectionVersion: 1,
+    plugins: [
+      { ref: { kind: 'builtin', id: 'webtools.translation' }, displayName: '翻译', icon: 'translation' },
+      { ref: { kind: 'declarative', id: 'webtools.translation' }, displayName: 'Untrusted Translation', icon: 'plugin' },
+    ],
+  })
+  for (const status of ['installed-disabled', 'invalid', 'incompatible', 'faulted', 'needs-permission']) {
+    env.rows([{ ...summary, status }])
+    assert.equal((await env.catalog.launcherProjection(env.catalog.session)).plugins.length, 1)
+  }
+  env.rows([{ ...summary, granted: [] }])
+  assert.equal((await env.catalog.launcherProjection(env.catalog.session)).plugins.length, 1)
+  await env.catalog.setEnabled({ kind: 'builtin', id: 'webtools.translation' }, false, env.catalog.session)
+  assert.deepEqual((await env.catalog.launcherProjection(env.catalog.session)).plugins, [])
+})
+
+test('real declarative install/enable/disable/re-enable/uninstall updates derived Launcher shortcuts', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'webtools-launcher-projection-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const core = new PluginManager({ userData: root, hostVersion: '0.1.0', confirm: async () => true, externalOpen: async () => {}, clipboardWrite() {}, ai: {} })
+  t.after(() => core.close())
+  await core.initialize()
+  const catalog = new PluginCatalog('0.1.0', () => core, builtinLifecycle())
+  const m = manifest({ id: 'org.example.private-notes', name: 'Private Notes' })
+  const ref = { kind: 'declarative', id: m.id }
+  const visible = async () => (await catalog.launcherProjection(catalog.session)).plugins.some(item => item.ref.kind === ref.kind && item.ref.id === ref.id)
+  await core.install(packageBytes(m), core.session); assert.equal(await visible(), false)
+  await catalog.setEnabled(ref, true, catalog.session); assert.equal(await visible(), true)
+  await catalog.setEnabled(ref, false, catalog.session); assert.equal(await visible(), false)
+  await catalog.setEnabled(ref, true, catalog.session); assert.equal(await visible(), true)
+  await core.uninstall(m.id, core.session); assert.equal(await visible(), false)
+})
