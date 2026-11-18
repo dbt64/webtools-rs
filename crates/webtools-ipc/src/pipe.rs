@@ -1,21 +1,25 @@
-//! Blocking named-pipe client with request/response correlation.
+//! Single-owner named-pipe connection with request/response correlation.
 //!
 //! Windows synchronous pipe handles serialise I/O on the underlying file object,
 //! so a background reader thread would deadlock writes (and vice versa). We keep
-//! one thread and poll with PeekNamedPipe instead: no concurrent I/O, no
-//! blocking read holding the handle while a write wants to go out.
+//! one thread and use PeekNamedPipe to read only bytes already available.
 
-use crate::{read_envelope, write_envelope, Ack, Envelope, ProtocolError, Result};
+use crate::{write_envelope, Ack, Envelope, FrameDecoder, ProtocolError, Result, MAX_MESSAGE_BYTES};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 pub struct Connection {
     file: File,
     backlog: VecDeque<Envelope>,
+    decoder: FrameDecoder,
+    partial_since: Option<Instant>,
 }
 
 impl Connection {
@@ -27,12 +31,7 @@ impl Connection {
         let mut last_error;
         loop {
             match OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        file,
-                        backlog: VecDeque::new(),
-                    })
-                }
+                Ok(file) => return Ok(Self::from_file(file)),
                 Err(error) => last_error = error,
             }
             if start.elapsed() >= deadline {
@@ -46,6 +45,8 @@ impl Connection {
         Self {
             file,
             backlog: VecDeque::new(),
+            decoder: FrameDecoder::default(),
+            partial_since: None,
         }
     }
 
@@ -71,31 +72,67 @@ impl Connection {
         write_envelope(&mut self.file, envelope)
     }
 
-    /// Non-blocking-ish poll: returns the next envelope, or None when nothing
-    /// arrived within the timeout.
+    /// Waits for an envelope, preserving fragments across individual polls.
+    /// A frame that remains incomplete past FRAME_TIMEOUT ends the connection.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<Envelope>> {
-        if let Some(envelope) = self.backlog.pop_front() {
-            return Ok(Some(envelope));
-        }
         let deadline = Instant::now() + timeout;
         loop {
-            if self.available()? > 0 {
-                if let Some(envelope) = read_envelope(&mut self.file)? {
-                    if std::env::var_os("WT_DUMP").is_some() {
-                        eprintln!(
-                            "[wire<] {}",
-                            serde_json::to_string(&envelope).unwrap_or_default()
-                        );
-                    }
-                    return Ok(Some(envelope));
+            if let Some(envelope) = self.backlog.pop_front() {
+                return Ok(Some(envelope));
+            }
+            let now = Instant::now();
+            if self
+                .partial_since
+                .is_some_and(|since| now - since >= FRAME_TIMEOUT)
+            {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "incomplete pipe frame").into());
+            }
+            let available = self.available()? as usize;
+            if available > 0 {
+                self.read_available(available, now)?;
+                if !self.backlog.is_empty() {
+                    continue;
                 }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(None);
             }
-            if Instant::now() >= deadline {
-                return Ok(None);
+            if available == 0 {
+                std::thread::sleep(remaining.min(Duration::from_millis(2)));
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn read_available(&mut self, available: usize, now: Instant) -> Result<()> {
+        // Leave room for a full-sized frame even if a second frame is already
+        // queued behind it. Only this thread consumes bytes from the handle.
+        let room = MAX_MESSAGE_BYTES + 4 - self.decoder.buffered_len();
+        let mut chunk = [0; READ_CHUNK_BYTES];
+        let to_read = available.min(room).min(READ_CHUNK_BYTES);
+        let count = self.file.read(&mut chunk[..to_read])?;
+        if count == 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "pipe closed while reading").into(),
+            );
+        }
+        let messages = self.decoder.push(&chunk[..count])?;
+        if self.decoder.buffered_len() == 0 {
+            self.partial_since = None;
+            self.decoder.trim_buffer(READ_CHUNK_BYTES);
+        } else if self.partial_since.is_none() || !messages.is_empty() {
+            self.partial_since = Some(now);
+        }
+        if std::env::var_os("WT_DUMP").is_some() {
+            for envelope in &messages {
+                eprintln!(
+                    "[wire<] {}",
+                    serde_json::to_string(envelope).unwrap_or_default()
+                );
+            }
+        }
+        self.backlog.extend(messages);
+        Ok(())
     }
 
     /// Sends a request and waits for its matching ack envelope.

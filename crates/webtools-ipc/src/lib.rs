@@ -224,6 +224,14 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
+    fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn trim_buffer(&mut self, retained_bytes: usize) {
+        self.buffer.shrink_to(retained_bytes);
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Envelope>> {
         if chunk.is_empty() {
             return Ok(Vec::new());

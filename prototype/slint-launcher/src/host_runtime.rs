@@ -222,6 +222,8 @@ impl HostCommand {
 }
 
 const MAX_ATTEMPTS: u32 = 5;
+const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PIPE_MESSAGES_PER_TURN: usize = 8;
 
 pub(crate) fn panel_handler(
     events: Sender<HostEvent>,
@@ -909,10 +911,38 @@ fn supervise(
             attempt += 1;
             continue;
         }
-        loop {
+        let mut publish_state = true;
+        'connected: loop {
             if cancelled.load(Ordering::SeqCst) {
                 link.host.kill();
                 return;
+            }
+            // A busy command queue must not starve the pipe, and a burst from
+            // the Manager must still leave room for the next local command.
+            let mut pipe_active = false;
+            for _ in 0..PIPE_MESSAGES_PER_TURN {
+                match link.session.pump(Duration::ZERO) {
+                    Ok(false) => break,
+                    Ok(true) => pipe_active = true,
+                    Err(error) => {
+                        lost = error.to_string();
+                        break 'connected;
+                    }
+                }
+                if link.session.closing {
+                    break;
+                }
+            }
+            if publish_state || pipe_active {
+                forward_features(
+                    &mut link.session,
+                    &events,
+                    &mut projection_seen,
+                    &projection_cache,
+                );
+                forward_websites(&link.session, &events, &mut websites_seen);
+                forward_results(&mut link.session, &events);
+                publish_state = false;
             }
             if let Err(error) = forward_completed_previews(&mut link.session, &events) {
                 lost = error.to_string();
@@ -922,7 +952,12 @@ fn supervise(
             if link.session.closing {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            let wait = if pipe_active {
+                Duration::ZERO
+            } else {
+                PIPE_POLL_INTERVAL
+            };
+            match rx.recv_timeout(wait) {
                 Ok(HostCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     link.host.kill();
                     eprintln!("host: stopped");
@@ -951,26 +986,14 @@ fn supervise(
                     }
                     last_activity = Instant::now();
                     trimmed = false;
+                    // A local request can dispatch incoming messages while
+                    // waiting for its own acknowledgement.
+                    publish_state = !matches!(&command, HostCommand::McpWake);
                     if link.session.closing {
                         break;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // Keep answering the manager while the UI is idle: it asks
-                    // for renderer state and projections on its own schedule.
-                    if let Err(error) = link.session.pump(Duration::from_millis(1)) {
-                        lost = error.to_string();
-                        break;
-                    }
-                    forward_features(
-                        &mut link.session,
-                        &events,
-                        &mut projection_seen,
-                        &projection_cache,
-                    );
-                    forward_websites(&link.session, &events, &mut websites_seen);
-                    forward_results(&mut link.session, &events);
-                    forward_confirmations(&mut link.session, &events);
                     if !trimmed && last_activity.elapsed() > idle_trim {
                         link.host.trim_working_set();
                         trimmed = true;

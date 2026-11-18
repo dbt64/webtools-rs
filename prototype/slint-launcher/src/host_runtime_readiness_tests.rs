@@ -65,7 +65,40 @@ fn queued_preview_waits_for_electron_services_ready() {
                 Duration::from_secs(3),
             )
             .unwrap();
+        let mut measured = false;
+        let mut probed = false;
         loop {
+            if !measured && root.join("measure-idle-ipc").exists() {
+                let mut samples = Vec::new();
+                for _ in 0..10 {
+                    let started = Instant::now();
+                    assert!(client
+                        .request(
+                            &Envelope::new("websites-update", serde_json::json!({"websites":[]})),
+                            Duration::from_secs(2),
+                        )
+                        .unwrap()
+                        .ok);
+                    samples.push(started.elapsed());
+                }
+                samples.sort_unstable();
+                eprintln!("warm IPC: median {:?}, max {:?}", samples[5], samples[9]);
+                std::fs::write(root.join("idle-measured"), "").unwrap();
+                measured = true;
+            }
+            if !probed && root.join("probe-busy-ipc").exists() {
+                let result = client.request(
+                    &Envelope::new("websites-update", serde_json::json!({"websites":[]})),
+                    Duration::from_millis(500),
+                );
+                let reply = if result.is_ok_and(|ack| ack.ok) {
+                    "ok"
+                } else {
+                    "timeout"
+                };
+                std::fs::write(root.join("busy-reply"), reply).unwrap();
+                probed = true;
+            }
             let message = match client.poll(Duration::from_millis(20)) {
                 Ok(Some(m)) => m,
                 Ok(None) => continue,
@@ -145,12 +178,43 @@ fn queued_preview_waits_for_electron_services_ready() {
             _ => {}
         }
     }
-    runtime.shutdown();
-    ownership.end_session("visible-panel");
     assert!(
         !root.join("premature").exists(),
         "preview was dispatched after hello but before Electron services were ready"
     );
     assert_eq!(output.as_deref(), Some("READY_TRANSLATION_RESULT"));
+    // Let the preview's ownership exchange finish before measuring an idle link.
+    std::thread::sleep(Duration::from_millis(150));
+    std::fs::write(root.join("measure-idle-ipc"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !root.join("idle-measured").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        root.join("idle-measured").exists(),
+        "warm IPC probe did not finish"
+    );
+
+    let commands = runtime.handle();
+    commands.send(HostCommand::McpWake).unwrap();
+    std::fs::write(root.join("probe-busy-ipc"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        commands.send(HostCommand::McpWake).unwrap();
+        if let Ok(reply) = std::fs::read_to_string(root.join("busy-reply")) {
+            if !reply.is_empty() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let reply = std::fs::read_to_string(root.join("busy-reply"));
+    runtime.shutdown();
+    ownership.end_session("visible-panel");
+    assert_eq!(
+        reply.as_deref().ok(),
+        Some("ok"),
+        "Manager IPC must respond while local commands keep arriving"
+    );
     assert!(!ownership.has_owners());
 }

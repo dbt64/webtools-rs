@@ -1,7 +1,6 @@
 # webtools-ipc
 
-Native <-> Manager 命名管道协议（v1）的 Rust 实现。只依赖 `serde` / `serde_json` /
-`windows-sys`（仅 PeekNamedPipe）。
+Native <-> Manager 命名管道协议（v1）的 Rust 实现。生产环境由 Rust 宿主创建管道，Electron Manager 连接。
 
 ## 线上格式
 
@@ -11,7 +10,7 @@ Native <-> Manager 命名管道协议（v1）的 Rust 实现。只依赖 `serde`
 最大帧: 4 MiB
 ```
 
-对端（manager）回包是 `type = "ack"` 的信封，payload 为：
+请求的对端回包是 `type = "ack"` 的信封，payload 为：
 
 ```json
 { "replyToId": "...", "replyToType": "...", "ok": true, "result": {}, "error": null }
@@ -19,7 +18,7 @@ Native <-> Manager 命名管道协议（v1）的 Rust 实现。只依赖 `serde`
 
 与 `NativePipeFrameCodec.cs` 和 `native-manager-protocol.ts` 逐字节一致。
 
-## 用法
+## 底层客户端示例
 
 ```rust
 use std::time::Duration;
@@ -36,13 +35,13 @@ Windows 的同步管道句柄在同一个 file object 上串行化 I/O。用
 `try_clone` 起一个后台读线程之后，写操作会被阻塞的读卡住，表现为
 「连上了、写不出去、也收不到 ack」。
 
-**实测踩过这个坑**：hello 发出去，对端一条日志都没有，进程永久挂住。
+当前由同一个后台线程处理读写。`poll()` 用 `PeekNamedPipe` 查询可用字节，
+按可用数量分批读取，增量解码器保留跨轮询的半帧。从开始读取起 5 秒内仍未收到完整帧时，
+连接返回超时，由上层处理断线恢复。
 
-所以这里不设读线程：`poll()` 用 `PeekNamedPipe` 先看有没有数据，
-有才 `read`。读写永远在同一个线程、不会并发，也就不存在死锁。
-
-代价是：服务端主动推送（`plugins-update` 等）不会实时唤醒调用方，
-需要调用方自己用定时器 `next_event(timeout)` 拉。对启动器来说够用。
+Rust 启动器每轮限制处理的管道消息数量，并给本地命令处理机会。等待下一轮的
+间隔并非 IPC 往返的硬上限。写入使用 Windows 同步 I/O，当对端停止读取且管道缓冲区满时，
+写操作可能阻塞。
 
 ## 测试
 
@@ -55,8 +54,8 @@ cargo run --example handshake -- WT.Test    # 握手 + 一次请求
 `tools/fake-manager.mjs` 是**协议桩**，不是 Electron 本体；它只实现
 `electron-host-ready` / `app-memory-get` / `app-memory-remember`。
 
-## 还没做
+## 会话行为
 
-- 双向：manager 发起的请求（`launcher-settings-update` 等）目前只会进 `backlog`
-- 重连：断线后需要上层重新 `connect`
-- capability 协商：现在只是透传，没有按能力裁剪请求
+- Rust `HostSession` 处理双向请求，等待回执期间也会分发收到的请求。
+- 连接恢复由宿主与 Manager 的上层逻辑负责，包括重新握手和同步状态。
+- 握手返回双方支持的能力交集，部分扩展（如 Quick Result、MCP）单独协商。
