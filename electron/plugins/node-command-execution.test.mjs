@@ -37,6 +37,16 @@ test('Utility startup preserves the existing validated command directory as cwd'
   assert.equal(env.forkOptions().cwd, dirname('D:/isolated/command.cjs'))
 })
 
+test('scheduled Node command receives stable identity without a foreground activation gesture', async () => {
+  const task = { code: 'scheduled-code', executionId: 'execution-1', scheduledAtMs: 12345 }
+  const env = await setup([{ type: 'capability', id: 1, method: 'external.open', payload: { url: 'https://example.test' } }], {
+    effects: { externalOpen: async () => assert.fail('Scheduled work must not gain a user gesture') },
+    capabilityCompletion: reply => { assert.equal(reply.ok, false); assert.equal(reply.code, 'USER_CANCELLED'); return { type: 'completed' } },
+  })
+  assert.deepEqual(await env.adapter.execute(env.authority, undefined, { task }), { status: 'completed' })
+  assert.deepEqual(env.started().task, task)
+})
+
 test('only a successful Host external.open marks command completion, without trusting child claims', async () => {
   let opened = 0
   const messages = [{ type: 'capability', id: 1, method: 'external.open', payload: { url: 'https://example.test/search?q=fixture' } }]

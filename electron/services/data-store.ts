@@ -8,8 +8,8 @@ import { normalizeTranslation2WorkspaceSettings } from '../../src/shared/transla
 import { normalizeWebsiteOrderByCollection } from './website-order.ts'
 
 type LegacyV2AppData = Omit<AppData, 'settings' | 'appSearchMemory' | 'websiteOrderByCollection'> & { appSearchMemory?: unknown; websiteOrderByCollection?: unknown } & {
-  settings: Omit<AppSettings, 'theme' | 'launcherDisplayMode' | 'sharedAI' | 'translation' | 'translation2'>
-    & Partial<Pick<AppSettings, 'theme' | 'launcherDisplayMode' | 'sharedAI' | 'translation' | 'translation2'>>
+  settings: Omit<AppSettings, 'theme' | 'launcherDisplayMode' | 'sharedAI' | 'translation' | 'translation2' | 'pluginFeatureShortcuts'>
+    & Partial<Pick<AppSettings, 'theme' | 'launcherDisplayMode' | 'sharedAI' | 'translation' | 'translation2' | 'pluginFeatureShortcuts'>>
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
@@ -33,6 +33,7 @@ function validV2(value: unknown): value is LegacyV2AppData {
     && isString(s.defaultSearchEngineId) && isString(s.quickSearchShortcut) && typeof s.launchOnStartup === 'boolean'
     && ['grid', 'list'].includes(String(s.websiteLayout)) && typeof s.everythingEnabled === 'boolean' && isString(s.everythingEsPath)
     && isString(s.aiBaseUrl) && isString(s.aiModel)
+    && (s.pluginFeatureShortcuts === undefined || Array.isArray(s.pluginFeatureShortcuts) && s.pluginFeatureShortcuts.every((item: unknown) => isRecord(item) && isString(item.pluginId) && isString(item.featureId) && isString(item.shortcut)))
     && (s.theme === undefined || s.theme === 'light' || s.theme === 'dark' || s.theme === 'system')
     && (s.launcherDisplayMode === undefined || s.launcherDisplayMode === 'compact' || s.launcherDisplayMode === 'expanded')
     && value.webEntries.every((x: unknown) => isRecord(x) && isString(x.id) && isString(x.name) && isString(x.url) && Array.isArray(x.folderIds) && x.folderIds.every(isString) && typeof x.createdAt === 'number')
@@ -48,6 +49,7 @@ function normalizeV2(input: LegacyV2AppData): AppData {
       ...input.settings,
       theme: input.settings.theme ?? 'dark',
       launcherDisplayMode: input.settings.launcherDisplayMode ?? 'compact',
+      pluginFeatureShortcuts: input.settings.pluginFeatureShortcuts ?? [],
       sharedAI: normalizeSharedAISettings(input.settings.sharedAI, input.settings.aiBaseUrl, input.settings.aiModel),
       translation: normalizeTranslationSettings(input.settings.translation),
       translation2: normalizeTranslation2WorkspaceSettings(input.settings.translation2),

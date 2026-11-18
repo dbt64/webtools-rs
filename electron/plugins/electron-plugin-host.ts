@@ -1,5 +1,6 @@
-import { clipboard, dialog, nativeImage, shell, type BrowserWindow } from 'electron'
+import { clipboard, ClipboardItem, desktopCapturer, dialog, nativeImage, Notification, screen, shell, type BrowserWindow } from 'electron'
 import { open } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { extname } from 'node:path'
 import type { DataStore } from '../services/data-store.ts'
 import type { SharedAIService } from '../services/shared-ai-service.ts'
@@ -8,9 +9,12 @@ import type { PluginConsent } from './permission-broker.ts'
 import { formatPluginConsentDetail } from './plugin-consent-view.ts'
 import { LIMITS } from './manifest.ts'
 import { fail } from './errors.ts'
-import type { WebCapabilityEffects } from './web-host-capabilities.ts'
+import type { ScreenDisplayInfo, WebCapabilityEffects } from './web-host-capabilities.ts'
 import { completeSharedAIForWeb } from './web-host-capabilities.ts'
 import { pluginRuntimeSession } from './plugin-runtime-session.ts'
+import { transcodeMedia } from './media-transcode.ts'
+import { createPluginWorkflowEffects } from './plugin-workflow-effects.ts'
+import { readClipboardImage } from './clipboard-image.ts'
 
 const consentText: Record<PluginConsent['kind'], string> = {
   'reset-config': '恢复此插件的默认设置？当前设置将保留为一份备份，并替换上一次设置备份。插件私有数据不会被删除。',
@@ -20,6 +24,7 @@ const consentText: Record<PluginConsent['kind'], string> = {
   grant: '授予以下宿主能力？插件仅能使用列出的声明式操作。',
   uninstall: '卸载此插件？将停止操作并删除该插件的受管程序文件。',
   'delete-data': '还要删除此插件的配置和私有数据吗？默认保留。',
+  schedule: '允许此插件创建以下定时任务？关闭插件窗口后仍会由托盘宿主按计划执行。',
   external: '打开插件声明的 HTTPS 链接？', clipboard: '将以下内容写入剪贴板？', ai: '确认发送以下内容至当前共享 AI 服务？',
 }
 interface PluginRuntimeAcceptanceOverrides {
@@ -28,7 +33,7 @@ interface PluginRuntimeAcceptanceOverrides {
   webEffects?: Partial<Omit<WebCapabilityEffects, 'hasForegroundGesture' | 'confirm'>>
 }
 
-export function createElectronPluginHost(deps: { userData: string; hostVersion: string; sharedAI: SharedAIService; dataStore: DataStore; getWindow(): BrowserWindow | null; deleteRuntimeData?(pluginId: string): Promise<void>; closeFeatureWindows?(pluginId: string): Promise<void>; clearTemporaryWindowTarget?(pluginId: string): void }, acceptance?: PluginRuntimeAcceptanceOverrides) {
+export function createElectronPluginHost(deps: { userData: string; hostVersion: string; sharedAI: SharedAIService; dataStore: DataStore; getWindow(): BrowserWindow | null; nativeHostExecutable?: string; pasteText?(text: string): Promise<void>; deleteRuntimeData?(pluginId: string): Promise<void>; closeFeatureWindows?(pluginId: string): Promise<void>; clearTemporaryWindowTarget?(pluginId: string): void; getFeatureShortcut?(pluginId: string, featureId: string): string | null }, acceptance?: PluginRuntimeAcceptanceOverrides) {
   const window = () => { const w = deps.getWindow(); if (!w || w.isDestroyed() || w.webContents.isDestroyed()) fail('SESSION_EXPIRED'); return w }
   const confirmForWindow = async (getWindow: () => BrowserWindow | null, request: PluginConsent, signal?: AbortSignal, allowNoWindow = false): Promise<boolean> => {
     if (acceptance) return acceptance.confirm(request)
@@ -95,15 +100,97 @@ export function createElectronPluginHost(deps: { userData: string; hostVersion: 
       return Buffer.concat(chunks)
     } finally { await file.close() }
   }
+  const notifications = new Set<Electron.Notification>()
+  const getDisplays = async (): Promise<ScreenDisplayInfo[]> => {
+    const displays = screen.getAllDisplays()
+    const primaryId = screen.getPrimaryDisplay().id
+    return displays.map((display, index) => ({
+      id: String(display.id),
+      label: display.label || (display.id === primaryId ? '主显示器' : `显示器 ${index + 1}`),
+      bounds: { x: display.bounds.x, y: display.bounds.y, width: display.bounds.width, height: display.bounds.height },
+      workArea: { x: display.workArea.x, y: display.workArea.y, width: display.workArea.width, height: display.workArea.height },
+      scaleFactor: display.scaleFactor,
+      rotation: display.rotation as ScreenDisplayInfo['rotation'],
+      primary: display.id === primaryId,
+    }))
+  }
+  const captureScreen = async (displayId?: string): Promise<string> => {
+    const displays = screen.getAllDisplays()
+    const display = displayId === undefined
+      ? screen.getPrimaryDisplay()
+      : displays.find(candidate => String(candidate.id) === displayId)
+    if (!display) throw Object.assign(new Error('Requested display is unavailable'), { code: 'INVALID_INPUT' })
+
+    const pixelWidth = Math.max(1, Math.round(display.bounds.width * display.scaleFactor))
+    const pixelHeight = Math.max(1, Math.round(display.bounds.height * display.scaleFactor))
+    const scale = Math.min(1, 2560 / pixelWidth, 1600 / pixelHeight)
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: Math.max(1, Math.round(pixelWidth * scale)), height: Math.max(1, Math.round(pixelHeight * scale)) },
+      fetchWindowIcons: false,
+    })
+    const source = sources.find(candidate => candidate.display_id === String(display.id))
+    if (!source || source.thumbnail.isEmpty()) throw Object.assign(new Error('Screen capture source unavailable'), { code: 'SCREEN_CAPTURE_UNAVAILABLE' })
+    return source.thumbnail.toDataURL()
+  }
   const webEffects: Omit<WebCapabilityEffects, 'hasForegroundGesture'> = {
-    confirm, clipboardWrite: text => clipboard.writeText(text), externalOpen: url => shell.openExternal(url),
+    confirm, clipboardWrite: text => clipboard.writeText(text), clipboardReadText: () => clipboard.readText(), externalOpen: url => shell.openExternal(url),
+    clipboardReadImage: () => readClipboardImage({ readItems: () => clipboard.read(), readFiles: async () => await clipboardFiles(deps.nativeHostExecutable, { operation: 'read' }) as string[], imageFromPath: path => { const image = nativeImage.createFromPath(path); return image.isEmpty() ? null : image.toDataURL() } }),
+    clipboardWriteImage: async dataUrl => { const image = nativeImage.createFromDataURL(dataUrl); if (image.isEmpty()) throw new Error('invalid image'); const bytes = Uint8Array.from(image.toPNG()); await clipboard.write([new ClipboardItem({ 'image/png': new Blob([bytes], { type: 'image/png' }) })]) },
+    clipboardReadFiles: async () => await clipboardFiles(deps.nativeHostExecutable, { operation: 'read' }) as string[],
+    clipboardWriteFiles: async paths => { await clipboardFiles(deps.nativeHostExecutable, { operation: 'write', paths }) },
+    openPath: path => shell.openPath(path),
+    pasteText: deps.pasteText,
+    notify: async (title, body) => { if (!Notification.isSupported()) throw new Error('Notifications unavailable'); const notification = new Notification({ title, body }); notifications.add(notification); notification.once('close', () => notifications.delete(notification)); notification.show() },
+    getDisplays,
+    captureScreen,
+    ...createPluginWorkflowEffects(),
+    getFeatureShortcut: deps.getFeatureShortcut,
     isAIConfigured: async () => (await deps.sharedAI.getDefaultProviderInfo()).configured,
     completeAI: (prompt, signal) => completeSharedAIForWeb(deps.sharedAI, prompt, signal),
     ...acceptance?.webEffects,
   }
+  const mediaBusy = new WeakSet<BrowserWindow>()
   const webEffectsForWindow = (getWindow: () => BrowserWindow | null): Omit<WebCapabilityEffects, 'hasForegroundGesture'> => ({
     ...webEffects, confirm: (request, signal) => confirmForWindow(getWindow, request, signal),
+    mediaTranscode: async (input, signal) => {
+      const w = getWindow()
+      if (!w || w.isDestroyed()) throw new Error('Window closed')
+      if (mediaBusy.has(w)) throw new Error('Media conversion already running')
+      mediaBusy.add(w)
+      try {
+        const result = await pluginRuntimeSession.withHostDialog(w, () => dialog.showSaveDialog(w, {
+          title: '保存转换后的音视频', defaultPath: `converted.${input.format}`,
+          filters: [{ name: input.format.toUpperCase(), extensions: [input.format] }],
+        }))
+        if (result.canceled || !result.filePath) return null
+        if (signal.aborted || w.isDestroyed()) throw new Error('Window closed')
+        return await transcodeMedia(input, result.filePath, signal)
+      } finally { mediaBusy.delete(w) }
+    },
+    choosePaths: async (kind, multiple) => {
+      const w = getWindow()
+      if (!w || w.isDestroyed()) throw new Error('Window closed')
+      const properties: Electron.OpenDialogOptions['properties'] = [kind === 'file' ? 'openFile' : 'openDirectory']
+      if (multiple) properties.push('multiSelections')
+      const result = await pluginRuntimeSession.withHostDialog(w, () => dialog.showOpenDialog(w, { properties }))
+      return result.canceled ? [] : result.filePaths
+    },
   })
   const commandEffects = { ...webEffects, confirm: (request: PluginConsent, signal?: AbortSignal) => confirmForWindow(() => null, request, signal, true) }
   return { manager, choosePackage, webEffects, webEffectsForWindow, commandEffects }
+}
+
+function clipboardFiles(executable: string | undefined, input: object): Promise<unknown> {
+  if (!executable) return Promise.reject(new Error('NativeHost unavailable'))
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['--clipboard-files-helper'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    let output = ''; let error = ''
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8')
+    child.stdout.on('data', chunk => { output += chunk }); child.stderr.on('data', chunk => { error += chunk })
+    child.on('error', reject)
+    child.stdin.on('error', reject)
+    child.on('close', code => { if (code !== 0) { reject(new Error(error || 'Clipboard helper failed')); return }; try { resolve(JSON.parse(output)) } catch (e) { reject(e) } })
+    child.stdin.end(JSON.stringify(input))
+  })
 }

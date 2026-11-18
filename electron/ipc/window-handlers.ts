@@ -7,7 +7,7 @@ export function registerWindowIpcHandlers(ipc: ManagerEventRegistry & ManagerInv
   isManagerMainFrame: (context: IpcSenderContext) => boolean
   markManagerRendererReady: (sender: WebContents) => void
   acknowledgeNativeManagerIntent: (context: IpcSenderContext, requestId: unknown, outcome: unknown) => void
-  performManagerWindowAction: (action: ManagerWindowAction) => IpcResult<{ maximized: boolean }>
+  performManagerWindowAction: (action: ManagerWindowAction) => IpcResult<{ maximized: boolean }> | Promise<IpcResult<{ maximized: boolean }>>
 }): () => void {
   const disposeEvents = registerManagerEventHandlers(ipc, deps.isManagerMainFrame, {
     [IPC_CHANNELS.managerReady]: event => deps.markManagerRendererReady(event.sender as WebContents),
@@ -15,7 +15,8 @@ export function registerWindowIpcHandlers(ipc: ManagerEventRegistry & ManagerInv
   })
   const disposeInvokes = registerManagerInvokeHandlers(ipc, deps.isManagerMainFrame, {
     [IPC_CHANNELS.managerWindowAction]: (_event, value: unknown) => {
-      if (value !== 'minimize' && value !== 'toggle-maximize' && value !== 'close') {
+      if (value !== 'minimize' && value !== 'toggle-maximize' && value !== 'close'
+        && value !== 'exit-background' && value !== 'end-run' && value !== 'toggle-detach') {
         return { ok: false, error: { code: 'INVALID_WINDOW_ACTION', message: '窗口操作无效。' } }
       }
       return deps.performManagerWindowAction(value)

@@ -6,6 +6,7 @@ const MESSAGES: Record<string, string> = {
   PERMISSION_DENIED: '插件尚未获得此操作权限。', PLUGIN_DISABLED: '插件当前不可用。', ACTION_NOT_DECLARED: '插件未声明此操作。',
   SESSION_EXPIRED: 'Manager 会话已结束。', USER_CONFIRMATION_REQUIRED: '需要用户确认此操作。', DOWNGRADE_DENIED: '降级需要明确确认。',
   CONFIG_INCOMPATIBLE: '新版本配置不兼容，已保留当前版本。', AI_BUSY: '此插件已有 AI 请求。', AI_RATE_LIMIT: '插件 AI 调用过于频繁。',
+  STORAGE_RECOVERY_FAILED: '插件备份导入失败，且原数据恢复未完成；请检查插件数据目录。',
   AI_TIMEOUT: '插件 AI 请求已超时。', ACTION_FAILED: '插件操作未完成。', OPERATION_FAILED: '插件操作失败，未更改现有激活版本。',
   STATE_INVALID: '内置插件状态文件损坏；可选择先备份后恢复。',
   STATE_UNSUPPORTED: '内置插件状态版本不受支持；原文件已保留。',

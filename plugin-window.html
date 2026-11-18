@@ -27,6 +27,14 @@
         <span class="loading-mark"><img id="plugin-window-loading-icon" alt="" /><span class="loading-spinner" aria-hidden="true"></span></span>
         <span>正在打开插件</span>
       </main>
+      <main id="plugin-window-search" aria-label="插件搜索" hidden>
+        <label class="plugin-search-input-row">
+          <span class="plugin-search-icon" aria-hidden="true">⌕</span>
+          <input id="plugin-window-search-input" type="search" autocomplete="off" spellcheck="false" maxlength="1024" />
+        </label>
+        <div id="plugin-window-search-status" role="status" aria-live="polite" hidden></div>
+        <div id="plugin-window-search-results" role="listbox" aria-label="搜索结果"></div>
+      </main>
     </div>
     <script type="module" src="/electron/renderer/plugin-window-chrome.ts"></script>
   </body>

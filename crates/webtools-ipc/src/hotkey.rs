@@ -1,7 +1,7 @@
 //! Formats and double-modifier recognition from WPF HotkeyBindingCodec.
 use std::collections::HashSet;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Binding {
     Chord { modifiers: u32, key: u32 },
     DoubleModifier { key: u32 },

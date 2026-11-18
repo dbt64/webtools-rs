@@ -15,7 +15,7 @@ pub fn default_launcher_state() -> Value {
             {"id":"baidu","name":"百度","template":"https://www.baidu.com/s?wd=%s","enabled":true,"builtIn":true,"order":1},
             {"id":"bilibili","name":"Bilibili","template":"https://search.bilibili.com/all?keyword=%s","enabled":true,"builtIn":true,"order":2}],
         "defaultSearchEngineId":"google","everythingEnabled":false,"everythingEsPath":"",
-        "websites":[],"appSearchMemory":[]})
+        "websites":[],"appSearchMemory":[],"pluginFeatureShortcuts":[]})
 }
 
 fn invalid() -> io::Error {
@@ -188,7 +188,29 @@ pub fn valid_launcher_state(state: &Value) -> bool {
     let Some(memory) = state["appSearchMemory"].as_array() else {
         return false;
     };
-    memory.len() <= 100
+    let Some(shortcuts) = state["pluginFeatureShortcuts"].as_array() else {
+        return false;
+    };
+    let mut shortcut_targets = HashSet::new();
+    let mut shortcut_bindings = HashSet::new();
+    let shortcuts_valid = shortcuts.len() <= 2000 && shortcuts.iter().all(|entry| {
+        let Some(plugin_id) = entry["pluginId"].as_str() else { return false };
+        let Some(feature_id) = entry["featureId"].as_str() else { return false };
+        let Some(shortcut) = entry["shortcut"].as_str() else { return false };
+        let binding = crate::hotkey::Binding::parse(shortcut);
+        let valid_plugin = (3..=128).contains(&plugin_id.len())
+            && plugin_id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+            && !plugin_id.starts_with(['.', '-']) && !plugin_id.ends_with(['.', '-'])
+            && !plugin_id.contains("..") && !["__proto__", "prototype", "constructor"].contains(&plugin_id);
+        let valid_feature = (1..=64).contains(&feature_id.len())
+            && feature_id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !feature_id.starts_with('-') && !feature_id.ends_with('-') && !feature_id.contains("--");
+        let Some(binding @ crate::hotkey::Binding::Chord { modifiers, .. }) = binding else { return false };
+        valid_plugin && valid_feature && entry.get("autoCopy").is_none_or(|value| value.is_boolean()) && (1..=80).contains(&len(shortcut)) && modifiers != 0
+            && shortcut_targets.insert((plugin_id.to_string(), feature_id.to_string()))
+            && shortcut_bindings.insert(binding)
+    });
+    shortcuts_valid && memory.len() <= 100
         && memory.iter().all(|entry| {
             let Some(query) = entry["query"].as_str() else {
                 return false;
@@ -212,6 +234,10 @@ fn normalize_state(mut state: Value) -> Value {
         .as_array_mut()
         .unwrap()
         .sort_by_key(|e| std::cmp::Reverse(e["lastUsedAt"].as_i64().unwrap()));
+    state["pluginFeatureShortcuts"].as_array_mut().unwrap().sort_by(|a, b| {
+        a["pluginId"].as_str().cmp(&b["pluginId"].as_str())
+            .then_with(|| a["featureId"].as_str().cmp(&b["featureId"].as_str()))
+    });
     for website in state["websites"].as_array_mut().unwrap() {
         let mut seen = HashSet::new();
         website["folderIds"]
@@ -403,6 +429,7 @@ const SETTINGS: &[&str] = &[
     "defaultSearchEngineId",
     "everythingEnabled",
     "everythingEsPath",
+    "pluginFeatureShortcuts",
 ];
 fn read_json(path: &Path, max: u64) -> io::Result<Value> {
     if fs::metadata(path)?.len() > max {
@@ -413,11 +440,31 @@ fn read_json(path: &Path, max: u64) -> io::Result<Value> {
     serde_json::from_slice(bytes).map_err(|_| invalid())
 }
 fn read_state(path: &Path) -> io::Result<Value> {
-    let state = read_json(path, 8 * 1024 * 1024)?;
+    let mut state = read_json(path, 8 * 1024 * 1024)?;
+    if state.get("pluginFeatureShortcuts").is_none() {
+        state["pluginFeatureShortcuts"] = json!([]);
+    }
     if valid_launcher_state(&state) {
         Ok(state)
     } else {
         Err(invalid())
+    }
+}
+
+#[cfg(test)]
+mod shortcut_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_modifier_spellings_cannot_bind_two_features() {
+        let mut state = default_launcher_state();
+        state["pluginFeatureShortcuts"] = json!([
+            {"pluginId":"org.example.one", "featureId":"open", "shortcut":"Ctrl+Alt+J"},
+            {"pluginId":"org.example.two", "featureId":"open", "shortcut":"Alt+Control+J"}
+        ]);
+        assert!(!valid_launcher_state(&state));
+        state["pluginFeatureShortcuts"][1]["shortcut"] = json!("Ctrl+Alt+K");
+        assert!(valid_launcher_state(&state));
     }
 }
 pub(crate) fn persist(path: &Path, bytes: &[u8]) -> io::Result<()> {

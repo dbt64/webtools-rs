@@ -1,10 +1,15 @@
 import { BrowserWindow, nativeImage, screen, WebContentsView, type NativeImage, type WebContents, type WebFrameMain } from 'electron'
+import { Buffer } from 'node:buffer'
+import { randomUUID } from 'node:crypto'
+import { BridgeWireError, type JsonValue } from '../../plugin-sdk/declarative-v1/web/protocol.mjs'
+import type { CapabilityRequest } from '../../plugin-sdk/declarative-v1/web/capability-methods.mjs'
 import type { FeatureRef, FeaturePresentation } from '../../src/shared/feature-contracts.ts'
 import { isWebFeatureAuthority, type WebFeatureAuthority } from './web-feature-authority.ts'
 import { WebPluginRuntime } from './web-plugin-runtime.ts'
 import type { InvocationTextContext } from './web-host-capabilities.ts'
 import type { PluginThemeSource } from './plugin-window-theme.ts'
-import { PLUGIN_WINDOW_CHROME_CHANNELS, type PluginWindowAction, type PluginWindowChromeState, type PluginWindowMode } from './plugin-window-chrome-contract.ts'
+import { PLUGIN_WINDOW_CHROME_CHANNELS, type PluginSearchUiAction, type PluginWindowAction, type PluginWindowChromeState, type PluginWindowMode } from './plugin-window-chrome-contract.ts'
+import { DEFAULT_HOST_HEIGHT, DEFAULT_HOST_WIDTH } from '../services/host-window-geometry.ts'
 
 const TITLEBAR_HEIGHT = 42
 interface WindowEntry {
@@ -29,15 +34,18 @@ interface WindowEntry {
   menuOverlayReady?: Promise<void>
   menuOpen: boolean
   alwaysOnTop: boolean
+  search: { visible: boolean; placeholder: string; value: string; loading: boolean; error: string; items: PluginWindowChromeState['search']['items']; focusToken: number; valueToken: number; revision: number }
   returning?: Promise<void>
 }
 interface ManagerEntry {
   kind: 'manager'
+  detached: boolean
   window: BrowserWindow
   close(): Promise<void>
   closing?: Promise<void>
   returning?: Promise<void>
 }
+interface BusinessWindowEntry { id: string; owner: WindowEntry; window: BrowserWindow; runtime: WebPluginRuntime; title: string; chrome: 'host' | 'frameless' | 'native'; alwaysOnTop: boolean; closing?: Promise<void> }
 interface TranslationEntry {
   kind: 'translation'
   window: BrowserWindow
@@ -52,6 +60,7 @@ function key(authority: WebFeatureAuthority): string {
 /** Owns presentation windows; package authority and execution stay in Runtime 2.0. */
 export class PluginWindowManager {
   private readonly windows = new Map<string, WindowEntry>()
+  private readonly businessWindows = new Map<string, BusinessWindowEntry>()
   private readonly closing = new Map<WindowEntry, Promise<void>>()
   private pendingReloads = 0
   private currentTemporaryTarget: TemporaryTarget | null = null
@@ -83,12 +92,89 @@ export class PluginWindowManager {
         }
         catch { console.warn('[plugin-theme] Could not update a closing Plugin Window background.') }
       }
+      for (const child of this.businessWindows.values()) this.publishBusinessChrome(child)
     })
   }
-  get hasSurfaces(): boolean { return this.managerEntry !== null || this.windows.size > 0 || this.closing.size > 0 || this.pendingReloads > 0 }
+  get hasSurfaces(): boolean { return this.managerEntry !== null || this.windows.size > 0 || this.businessWindows.size > 0 || this.closing.size > 0 || this.pendingReloads > 0 }
+
+  async dispatchPluginWindow(source: BrowserWindow, sourceId: string, request: CapabilityRequest): Promise<JsonValue> {
+    const sourceChild = [...this.businessWindows.values()].find(item => item.window === source && item.id === sourceId)
+    const owner = sourceChild?.owner ?? [...this.windows.values()].find(item => item.window === source && sourceId === 'main')
+    if (!owner || owner.closing) throw new BridgeWireError('RUNTIME_CLOSED')
+    if (request.method === 'window.create') {
+      const authority = owner.runtime.authorityForWindow()
+      if (!authority?.isCurrent('plugin.window.manage')) throw new BridgeWireError('PERMISSION_DENIED')
+      if (request.payload.document && !authority.snapshot.inventory.some(item => item.canonicalPath === request.payload.document && item.mimeType === 'text/html')) throw new BridgeWireError('INVALID_REQUEST')
+      const id = randomUUID()
+      const chrome = request.payload.chrome ?? 'host'
+      const title = request.payload.title ?? owner.title
+      const window = new BrowserWindow({ parent: owner.window, title: request.payload.title ?? owner.title,
+        width: request.payload.width ?? 640, height: request.payload.height ?? 480, show: false, skipTaskbar: true, autoHideMenuBar: true,
+        frame: chrome === 'native', backgroundColor: this.deps.theme.current.backgroundColor,
+        ...(chrome === 'host' ? { webPreferences: { ...(this.deps.chromePreload ? { preload: this.deps.chromePreload } : {}), sandbox: true, nodeIntegration: false, contextIsolation: true, webviewTag: false } } : {}) })
+      if (chrome === 'host') {
+        window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+        window.webContents.on('will-navigate', event => event.preventDefault())
+      }
+      const runtime = this.deps.createRuntime(() => window.isDestroyed() ? null : window)
+      const child: BusinessWindowEntry = { id, owner, window, runtime, title, chrome, alwaysOnTop: false }
+      this.businessWindows.set(id, child)
+      const bounds = () => { if (!window.isDestroyed()) { const [width, height] = window.getContentSize(); const top = chrome === 'host' ? TITLEBAR_HEIGHT : 0; runtime.setBounds({ x: 0, y: top, width, height: height - top }) } }
+      window.on('resize', bounds)
+      window.on('maximize', () => this.publishBusinessChrome(child))
+      window.on('unmaximize', () => this.publishBusinessChrome(child))
+      window.on('close', event => { event.preventDefault(); void this.closeBusinessWindow(child) })
+      window.on('closed', () => { void this.closeBusinessWindow(child) })
+      try {
+        await Promise.all([runtime.openAuthority(authority, undefined, { windowId: id, ownsAuthority: false, document: request.payload.document }),
+          chrome === 'host' ? this.deps.loadChrome?.(window) : undefined])
+        if (owner.closing || window.isDestroyed()) throw new Error('Owner closed')
+        bounds(); runtime.setVisible(true); this.publishBusinessChrome(child)
+        if (chrome === 'host') window.setOpacity(1)
+        window.show(); this.deps.onSurfacesChanged()
+        return { id }
+      } catch (error) { await this.closeBusinessWindow(child); throw error }
+    }
+    if (!request.method.startsWith('window.')) throw new BridgeWireError('INVALID_REQUEST')
+    const payload = request.payload as { id?: string; targetId?: string; data?: JsonValue; x?: number; y?: number; width?: number; height?: number; enabled?: boolean }
+    const targetId = request.method === 'window.postMessage' ? payload.targetId : payload.id
+    const child = targetId === 'main' ? undefined : this.businessWindows.get(targetId ?? '')
+    if (targetId !== 'main' && (!child || child.owner !== owner || child.closing)) throw new BridgeWireError('INVALID_REQUEST')
+    const window = child?.window ?? owner.window
+    const runtime = child?.runtime ?? owner.runtime
+    if (request.method === 'window.show') { window.show(); window.focus() }
+    else if (request.method === 'window.hide') window.hide()
+    else if (request.method === 'window.setBounds') window.setBounds({ x: payload.x!, y: payload.y!, width: payload.width!, height: payload.height! })
+    else if (request.method === 'window.setAlwaysOnTop') { window.setAlwaysOnTop(payload.enabled!); if (child) { child.alwaysOnTop = payload.enabled!; this.publishBusinessChrome(child) } }
+    else if (request.method === 'window.postMessage') runtime.publishWindowMessage(sourceId, payload.data ?? null)
+    else if (request.method === 'window.close') setImmediate(() => { if (child) void this.closeBusinessWindow(child); else void this.closeEntry(owner) })
+    else throw new BridgeWireError('INVALID_REQUEST')
+    return null
+  }
+
+  private closeBusinessWindow(child: BusinessWindowEntry): Promise<void> {
+    if (child.closing) return child.closing
+    child.closing = (async () => {
+      try { await child.runtime.close() } finally {
+        if (!child.window.isDestroyed()) child.window.destroy()
+        this.businessWindows.delete(child.id)
+        child.owner.runtime.publishWindowClosed(child.id)
+        for (const other of this.businessWindows.values()) if (other.owner === child.owner) other.runtime.publishWindowClosed(child.id)
+        this.deps.onSurfacesChanged()
+      }
+    })()
+    return child.closing
+  }
+  private businessChromeState(child: BusinessWindowEntry): PluginWindowChromeState {
+    return { title: child.title, iconDataUrl: child.owner.iconDataUrl, mode: 'detached', customWindow: true, alwaysOnTop: child.alwaysOnTop,
+      maximized: child.window.isMaximized(), loading: false, themeCss: this.deps.theme.current.css, search: { ...child.owner.search, visible: false, items: [] } }
+  }
+  private publishBusinessChrome(child: BusinessWindowEntry): void {
+    if (child.chrome === 'host' && !child.window.isDestroyed() && !child.window.webContents.isDestroyed()) child.window.webContents.send(PLUGIN_WINDOW_CHROME_CHANNELS.state, this.businessChromeState(child))
+  }
   clearTemporaryTarget(): void { this.currentTemporaryTarget = null }
   registerManagerWindow(window: BrowserWindow, close: () => Promise<void>): void {
-    const entry: ManagerEntry = { kind: 'manager', window, close }
+    const entry: ManagerEntry = { kind: 'manager', window, close, detached: false }
     this.managerEntry = entry
     window.on('focus', () => this.rememberFocused(entry))
     window.on('blur', () => this.settleBlur(entry))
@@ -98,6 +184,62 @@ export class PluginWindowManager {
       this.deps.onSurfacesChanged()
     })
     this.bindEscape(window)
+  }
+  toggleManagerDetached(window: BrowserWindow): boolean {
+    const entry = this.managerEntry
+    if (!entry || entry.window !== window || entry.closing || window.isDestroyed()) return false
+    entry.detached = !entry.detached
+    window.setSkipTaskbar(!entry.detached)
+    if (entry.detached && this.currentTemporaryTarget === entry) this.clearTemporaryTarget()
+    if (!entry.detached) this.rememberFocused(entry)
+    return true
+  }
+  async exitManagerToBackground(window: BrowserWindow): Promise<boolean> {
+    const entry = this.managerEntry
+    if (!entry || entry.window !== window || window.isDestroyed() || entry.closing) return false
+    if (entry.returning) {
+      await entry.returning
+      return window.isDestroyed() || !window.isVisible()
+    }
+    if (!this.deps.returnToLauncher) return false
+    let exited = false
+    entry.returning = (async () => {
+      const shown = await this.deps.returnToLauncher?.() ?? false
+      if (!shown || this.managerEntry !== entry || window.isDestroyed()) return
+      await this.prepareLauncherFocus()
+      if (this.managerEntry !== entry || window.isDestroyed()) return
+      if (this.currentTemporaryTarget === entry) this.clearTemporaryTarget()
+      window.hide()
+      exited = true
+      await this.focusReturnedLauncher()
+    })().catch(() => console.warn('[plugin-window] Returning Manager to the Launcher failed.')).finally(() => { entry.returning = undefined })
+    await entry.returning
+    return exited
+  }
+  async endManagerRun(window: BrowserWindow): Promise<boolean> {
+    const entry = this.managerEntry
+    if (!entry || entry.window !== window || window.isDestroyed()) return false
+    if (entry.returning) {
+      await entry.returning
+      if (window.isDestroyed()) return true
+    }
+    let ended = false
+    const ending = (async () => {
+      let launcherShown = false
+      try { launcherShown = await this.deps.returnToLauncher?.() ?? false }
+      catch { console.warn('[plugin-window] Returning to the Launcher before ending Manager failed.') }
+      if (launcherShown) await this.prepareLauncherFocus()
+      await this.closeTemporaryTarget(entry)
+      ended = window.isDestroyed()
+      if (launcherShown && ended) await this.focusReturnedLauncher()
+    })()
+    entry.returning = ending
+    try {
+      await ending
+      return ended
+    } finally {
+      if (entry.returning === ending) entry.returning = undefined
+    }
   }
   registerTranslationWindow(window: BrowserWindow, close: () => Promise<void>): void {
     const entry: TranslationEntry = { kind: 'translation', window, close }
@@ -116,7 +258,7 @@ export class PluginWindowManager {
     if (previous && this.shouldCloseWhenSwitched(previous)) this.closeSwitchedTarget(previous)
   }
   private shouldCloseWhenSwitched(entry: TemporaryTarget): boolean {
-    return entry.kind === 'manager' || entry.kind === 'translation'
+    return entry.kind === 'manager' ? !entry.detached : entry.kind === 'translation'
       || entry.presentationMode === 'attached' && entry.blurBehavior === 'temporary-hide'
   }
   private closeSwitchedTarget(entry: TemporaryTarget): void {
@@ -185,7 +327,7 @@ export class PluginWindowManager {
           finish(false)
           return
         }
-        if (entry.kind === 'feature' && window.isFocused()) entry.runtime.focus()
+        if (entry.kind === 'feature' && window.isFocused()) this.focusFeatureContent(entry)
         checkFocus()
       }
       const onClosed = () => finish(false)
@@ -221,6 +363,7 @@ export class PluginWindowManager {
     return !entry.window.isDestroyed() && entry.window.isFocused()
   }
   private rememberFocused(entry: TemporaryTarget): void {
+    if (entry.kind === 'manager' && entry.detached) return
     if (entry.closing || !entry.window.isFocused() || entry.kind === 'feature'
       && !entry.loading && (entry.restarting || entry.runtime.status.state !== 'READY')) return
     const previous = this.currentTemporaryTarget
@@ -237,7 +380,8 @@ export class PluginWindowManager {
         : entry.kind === 'translation' ? this.translationEntry !== entry
           : this.windows.get(entry.key) !== entry || entry.restarting && !entry.loading
       if (noLongerOwned || entry.window.isDestroyed() || entry.closing
-        || entry.window.isMinimized() || entry.window.isFocused() || this.deps.hasPendingHostDialogs?.(entry.window)) return
+        || entry.window.isMinimized() || entry.window.isFocused() || !entry.window.isEnabled() || entry.kind === 'feature' && [...this.businessWindows.values()].some(child => child.owner === entry && child.window.isFocused()) || this.deps.hasPendingHostDialogs?.(entry.window)) return
+      if (entry.kind === 'manager' && entry.detached) return
       if (entry.kind === 'feature') this.closeMenuOverlay(entry)
       if (entry.kind !== 'feature' || entry.presentationMode === 'attached' && entry.blurBehavior === 'temporary-hide') entry.window.hide()
     })
@@ -248,11 +392,19 @@ export class PluginWindowManager {
   }
   handleEscape(window: BrowserWindow): boolean {
     const entry = this.managerEntry?.window === window ? this.managerEntry : [...this.windows.values()].find(item => item.window === window)
+    if (entry?.kind === 'feature' && entry.search.visible) {
+      this.hideSearch(entry, true)
+      return true
+    }
     if (!entry || entry.closing || entry.kind === 'feature'
       && !entry.loading && (entry.restarting || entry.runtime.status.state !== 'READY')
       || this.deps.hasPendingHostDialogs?.(window)) return false
     if (entry.kind === 'feature' && entry.presentationMode === 'detached') {
       void this.endPluginRun(entry).catch(() => console.warn('[plugin-window] Ending the detached Feature failed.'))
+      return true
+    }
+    if (entry.kind === 'manager' && entry.detached) {
+      void this.closeTemporaryTarget(entry)
       return true
     }
     if (entry.returning) return true
@@ -266,13 +418,13 @@ export class PluginWindowManager {
     }).catch(() => console.warn('[plugin-window] Returning to Launcher failed.')).finally(() => { entry.returning = undefined })
     return true
   }
-  handleInput(window: BrowserWindow, input: { key: string; type: string; isAutoRepeat?: boolean; control?: boolean; meta?: boolean; alt?: boolean; shift?: boolean }): boolean {
+  handleInput(window: BrowserWindow, input: { key: string; type: string; isAutoRepeat?: boolean; isComposing?: boolean; control?: boolean; meta?: boolean; alt?: boolean; shift?: boolean }): boolean {
     if (input.type !== 'keyDown' || input.isAutoRepeat) return false
-    if (input.key === 'Escape' && !input.control && !input.meta && !input.alt && !input.shift) return this.handleEscape(window)
+    if (input.key === 'Escape' && !input.isComposing && !input.control && !input.meta && !input.alt && !input.shift) return this.handleEscape(window)
     if (input.key.toLowerCase() === 'd' && input.control && !input.meta && !input.alt && !input.shift) {
       const entry = [...this.windows.values()].find(item => item.window === window)
-      if (!entry || entry.closing || entry.restarting || entry.runtime.status.state !== 'READY' || entry.presentationMode === 'detached') return false
-      this.detach(entry)
+      if (!entry || entry.closing || entry.restarting || entry.runtime.status.state !== 'READY') return false
+      this.toggleDetached(entry)
       return true
     }
     return false
@@ -280,7 +432,7 @@ export class PluginWindowManager {
   private bindEscape(window: BrowserWindow): void {
     window.webContents.on('before-input-event', (event, input) => {
       if (input.type === 'keyDown' && input.key === 'Escape' && !input.isAutoRepeat
-        && !input.control && !input.meta && !input.alt && !input.shift && this.handleEscape(window)) event.preventDefault()
+        && !input.isComposing && !input.control && !input.meta && !input.alt && !input.shift && this.handleEscape(window)) event.preventDefault()
     })
   }
   private bindFeatureInput(window: BrowserWindow): void {
@@ -292,9 +444,18 @@ export class PluginWindowManager {
     if (entry.window.isDestroyed()) return false
     if (entry.window.isMinimized()) entry.window.restore()
     entry.window.show(); entry.window.moveTop(); entry.window.focus()
-    if (entry.kind === 'feature') entry.runtime.focus()
+    if (entry.kind === 'feature') this.focusFeatureContent(entry)
     this.rememberFocused(entry)
     return entry.window.isFocused()
+  }
+  private focusFeatureContent(entry: WindowEntry): void {
+    if (entry.search.visible) {
+      entry.search = { ...entry.search, focusToken: entry.search.focusToken + 1 }
+      entry.window.webContents.focus()
+      this.publishChromeState(entry)
+      return
+    }
+    entry.runtime.focus()
   }
   private icon(authority: WebFeatureAuthority): string | NativeImage {
     const manifest = authority.snapshot.manifest
@@ -313,7 +474,8 @@ export class PluginWindowManager {
   }
   private chromeState(entry: WindowEntry): PluginWindowChromeState {
     return { title: entry.title, iconDataUrl: entry.iconDataUrl, mode: entry.presentationMode,
-      alwaysOnTop: entry.alwaysOnTop, maximized: entry.window.isMaximized(), loading: entry.loading, themeCss: this.deps.theme.current.css }
+      alwaysOnTop: entry.alwaysOnTop, maximized: entry.window.isMaximized(), loading: entry.loading, themeCss: this.deps.theme.current.css,
+      search: { ...entry.search, items: entry.search.items.map(item => ({ ...item })) } }
   }
   private publishChromeState(entry: WindowEntry): void {
     if (entry.window.isDestroyed() || entry.window.webContents.isDestroyed()) return
@@ -327,17 +489,90 @@ export class PluginWindowManager {
   }
   getChromeState(window: BrowserWindow): PluginWindowChromeState | null {
     const entry = [...this.windows.values()].find(item => item.window === window)
-    return entry && !entry.closing ? this.chromeState(entry) : null
+    if (entry && !entry.closing) return this.chromeState(entry)
+    const child = [...this.businessWindows.values()].find(item => item.window === window && item.chrome === 'host' && !item.closing)
+    return child ? this.businessChromeState(child) : null
+  }
+  applySearchUi(window: BrowserWindow, action: PluginSearchUiAction): string | null | undefined {
+    const entry = [...this.windows.values()].find(item => item.window === window)
+    if (!entry || entry.closing || entry.restarting || entry.runtime.status.state !== 'READY') return undefined
+    switch (action.type) {
+      case 'show':
+        entry.search = { ...entry.search, visible: true, placeholder: action.placeholder, value: '', loading: false, error: '', items: [], revision: entry.search.revision + 1, focusToken: entry.search.focusToken + 1, valueToken: entry.search.valueToken + 1 }
+        entry.menuOpen = false; this.closeMenuOverlay(entry)
+        entry.runtime.setVisible(false); entry.window.webContents.focus(); this.publishChromeState(entry)
+        return null
+      case 'hide':
+        this.hideSearch(entry, true); return null
+      case 'get-text':
+        return entry.search.value
+      case 'set-text':
+        if (!entry.search.visible) return null
+        entry.search = { ...entry.search, valueToken: entry.search.valueToken + 1 }
+        if (!this.updateSearchInput(entry, action.text)) this.publishChromeState(entry)
+        return null
+      case 'focus':
+        if (entry.search.visible) { entry.search.focusToken++; entry.window.webContents.focus(); this.publishChromeState(entry) }
+        return null
+      case 'release-focus':
+        this.hideSearch(entry, true); return null
+      case 'results-update':
+        if (!entry.search.visible || action.query !== entry.search.value || action.revision !== entry.search.revision) return null
+        entry.search = { ...entry.search, loading: action.loading, error: action.error ?? '', items: action.items.map(item => ({
+          id: item.id, title: item.title, description: item.description ?? '', icon: item.icon ?? '',
+        })) }
+        this.publishChromeState(entry); return null
+      case 'results-clear':
+        if (!entry.search.visible || action.query !== entry.search.value || action.revision !== entry.search.revision) return null
+        entry.search = { ...entry.search, loading: false, error: '', items: [] }
+        this.publishChromeState(entry); return null
+    }
+  }
+  searchInputChanged(window: BrowserWindow, value: unknown): boolean {
+    const entry = [...this.windows.values()].find(item => item.window === window)
+    if (!entry || entry.closing || !entry.search.visible || typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > 1024) return false
+    return this.updateSearchInput(entry, value)
+  }
+  selectSearchResult(window: BrowserWindow, id: unknown): boolean {
+    const entry = [...this.windows.values()].find(item => item.window === window)
+    if (!entry || entry.closing || !entry.search.visible || typeof id !== 'string') return false
+    const item = entry.search.items.find(candidate => candidate.id === id)
+    if (!item) return false
+    entry.runtime.publishSearchSelection({ id: item.id, query: entry.search.value, revision: entry.search.revision, item })
+    return true
+  }
+  private updateSearchInput(entry: WindowEntry, value: string): boolean {
+    if (!entry.search.visible || entry.search.value === value) return false
+    entry.search = { ...entry.search, value, loading: value.length > 0, error: '', items: [], revision: entry.search.revision + 1 }
+    this.publishChromeState(entry)
+    entry.runtime.publishSearchInput(value, entry.search.revision)
+    return true
+  }
+  private hideSearch(entry: WindowEntry, focusRuntime: boolean): void {
+    if (!entry.search.visible) return
+    entry.search = { ...entry.search, visible: false, value: '', loading: false, error: '', items: [], revision: entry.search.revision + 1 }
+    entry.window.webContents.focus()
+    entry.runtime.setVisible(!entry.loading)
+    this.publishChromeState(entry)
+    if (focusRuntime && !entry.loading) entry.runtime.focus()
   }
   chromeOwnerFor(sender: WebContents, senderFrame: WebFrameMain | null): BrowserWindow | null {
     if (!senderFrame || senderFrame !== sender.mainFrame) return null
     const entry = [...this.windows.values()].find(item => !item.closing
       && (item.window.webContents === sender || item.menuOverlay?.webContents === sender))
-    return entry?.window ?? null
+    return entry?.window ?? [...this.businessWindows.values()].find(item => !item.closing && item.chrome === 'host' && item.window.webContents === sender)?.window ?? null
   }
   async performChromeAction(window: BrowserWindow, action: unknown): Promise<boolean> {
+    const child = [...this.businessWindows.values()].find(item => item.window === window && item.chrome === 'host' && !item.closing)
+    if (child) {
+      if (action === 'close') { await this.closeBusinessWindow(child); return true }
+      if (action === 'minimize') { window.minimize(); return true }
+      if (action === 'toggle-maximize') { if (window.isMaximized()) window.unmaximize(); else window.maximize(); this.publishBusinessChrome(child); return true }
+      if (action === 'pin') { child.alwaysOnTop = !child.alwaysOnTop; window.setAlwaysOnTop(child.alwaysOnTop); this.publishBusinessChrome(child); return true }
+      return action === 'close-menu'
+    }
     const entry = [...this.windows.values()].find(item => item.window === window)
-    const actions: readonly PluginWindowAction[] = ['toggle-menu', 'close-menu', 'detach', 'about', 'settings', 'exit-background', 'end-run', 'pin', 'minimize', 'toggle-maximize', 'close']
+    const actions: readonly PluginWindowAction[] = ['toggle-menu', 'close-menu', 'toggle-detach', 'about', 'settings', 'exit-background', 'end-run', 'pin', 'minimize', 'toggle-maximize', 'close']
     if (!entry || entry.closing || !actions.includes(action as PluginWindowAction)) return false
     switch (action as PluginWindowAction) {
       case 'toggle-menu':
@@ -354,9 +589,9 @@ export class PluginWindowManager {
         }
       case 'close-menu':
         this.closeMenuOverlay(entry); return true
-      case 'detach':
-        if (entry.restarting || entry.runtime.status.state !== 'READY' || entry.presentationMode === 'detached') return false
-        this.detach(entry); this.closeMenuOverlay(entry); return true
+      case 'toggle-detach':
+        if (entry.restarting || entry.runtime.status.state !== 'READY') return false
+        this.toggleDetached(entry); this.closeMenuOverlay(entry); return true
       case 'about':
       case 'settings':
         await this.deps.openPluginManager?.({ kind: 'web', id: entry.ref.pluginId, featureId: entry.ref.featureId }, action as 'about' | 'settings')
@@ -440,26 +675,13 @@ export class PluginWindowManager {
     entry.menuOpen = false
     if (entry.menuOverlay && !entry.menuOverlay.webContents.isDestroyed()) entry.menuOverlay.setVisible(false)
   }
-  private detach(entry: WindowEntry): void {
-    entry.presentationMode = 'detached'
-    entry.window.setSkipTaskbar(false)
+  private toggleDetached(entry: WindowEntry): void {
+    entry.presentationMode = entry.presentationMode === 'attached' ? 'detached' : 'attached'
+    entry.window.setSkipTaskbar(entry.presentationMode === 'attached')
     entry.window.setAlwaysOnTop(entry.alwaysOnTop)
-    const current = entry.window.getBounds()
-    const area = screen.getDisplayMatching(current).workArea
-    const width = Math.min(area.width, Math.max(current.width + 160, Math.round(current.width * 1.2)))
-    const height = Math.min(area.height, Math.max(current.height + 120, Math.round(current.height * 1.2)))
-    const left = Math.round(current.x + current.width / 2 - width / 2)
-    const top = Math.round(current.y + current.height / 2 - height / 2)
-    entry.window.setBounds({
-      x: Math.max(area.x, Math.min(left, area.x + area.width - width)),
-      y: Math.max(area.y, Math.min(top, area.y + area.height - height)),
-      width,
-      height,
-    })
     this.publishChromeState(entry)
     this.closeMenuOverlay(entry)
     this.focus(entry)
-    this.rememberFocused(entry)
   }
   private hideToBackground(entry: WindowEntry): void {
     if (this.currentTemporaryTarget === entry) this.clearTemporaryTarget()
@@ -541,6 +763,7 @@ export class PluginWindowManager {
     if (entry && entry.packageHash === authority.snapshot.packageHash && entry.runtime.status.state === 'READY') {
       try {
         entry.runtime.updateContext(currentContext())
+        entry.runtime.notifyEnter()
         if (this.deps.presentWindow) await this.deps.presentWindow(entry.window)
         this.focus(entry)
       } finally { authority.revoke() }
@@ -550,8 +773,8 @@ export class PluginWindowManager {
       const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
       const minWidth = Math.min(area.width, Math.max(240, preferences.minWidth ?? 360))
       const minHeight = Math.min(area.height, Math.max(160, preferences.minHeight ?? 260))
-      const width = Math.min(area.width, Math.max(minWidth, preferences.defaultWidth ?? 960))
-      const height = Math.min(area.height, Math.max(minHeight, preferences.defaultHeight ?? 680))
+      const width = Math.min(area.width, Math.max(minWidth, preferences.defaultWidth ?? DEFAULT_HOST_WIDTH))
+      const height = Math.min(area.height, Math.max(minHeight, preferences.defaultHeight ?? DEFAULT_HOST_HEIGHT))
       const window = new BrowserWindow({ title: feature.title || manifest.name, icon: this.icon(authority),
         width, height, minWidth, minHeight, x: Math.round(area.x + (area.width - width) / 2), y: Math.round(area.y + (area.height - height) / 2),
         resizable: preferences.resizable ?? true, show: false, frame: false, skipTaskbar: true, autoHideMenuBar: true, backgroundColor: this.deps.theme.current.backgroundColor,
@@ -569,15 +792,20 @@ export class PluginWindowManager {
         developmentSessionId: authority.development?.sessionId, window, runtime, restarting: false, packageHash: authority.snapshot.packageHash,
         blurBehavior: preferences.blurBehavior ?? 'temporary-hide', presentationMode: 'attached', title,
         iconDataUrl: this.iconDataUrl(authority), loading: true,
-        chromeReady: this.deps.loadChrome?.(window) ?? Promise.resolve(), menuOpen: false, alwaysOnTop: false }
+        chromeReady: this.deps.loadChrome?.(window) ?? Promise.resolve(), menuOpen: false, alwaysOnTop: false,
+        search: { visible: false, placeholder: '搜索', value: '', loading: false, error: '', items: [], focusToken: 0, valueToken: 0, revision: 0 } }
       this.windows.set(identity, entry)
       const owned = entry
       this.bindFeatureInput(window)
-      const bounds = () => { if (!window.isDestroyed()) { const [width, height] = window.getContentSize(); runtime.setBounds({ x: 0, y: TITLEBAR_HEIGHT, width, height: height - TITLEBAR_HEIGHT }); runtime.setVisible(!owned.loading); this.windowGeometryChanged(window) } }
+      const bounds = () => { if (!window.isDestroyed()) { const [width, height] = window.getContentSize(); runtime.setBounds({ x: 0, y: TITLEBAR_HEIGHT, width, height: height - TITLEBAR_HEIGHT }); runtime.setVisible(!owned.loading && !owned.search.visible); this.windowGeometryChanged(window) } }
       const unsubscribe = runtime.subscribe(status => {
         bounds()
         if (status.state === 'FAULTED' || status.state === 'CLOSED' && !owned.restarting && !owned.closing) void this.closeEntry(owned)
       })
+      window.on('show', () => runtime.notifyVisibility(true))
+      window.on('hide', () => runtime.notifyVisibility(false))
+      window.on('minimize', () => runtime.notifyVisibility(false))
+      window.on('restore', () => runtime.notifyVisibility(window.isVisible()))
       window.on('resize', bounds)
       window.on('maximize', () => this.publishChromeState(owned))
       window.on('unmaximize', () => this.publishChromeState(owned))
@@ -607,6 +835,7 @@ export class PluginWindowManager {
       owned.runtime.setVisible(true)
       owned.restarting = false
       this.publishChromeState(owned)
+      owned.runtime.notifyEnter()
       if (this.deps.presentWindow) await this.deps.presentWindow(owned.window)
       this.focus(owned)
       const previous = owned.previousTemporaryTarget
@@ -628,6 +857,7 @@ export class PluginWindowManager {
     if (entry.closing) return entry.closing
     if (this.currentTemporaryTarget === entry) this.clearTemporaryTarget()
     entry.closing = (async () => {
+      await Promise.all([...this.businessWindows.values()].filter(child => child.owner === entry).map(child => this.closeBusinessWindow(child)))
       this.closeMenuOverlay(entry)
       const menuOverlay = entry.menuOverlay
       entry.menuOverlay = undefined

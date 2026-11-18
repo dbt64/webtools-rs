@@ -4,7 +4,7 @@ import type { NativeLauncherSettingsUpdate } from '../services/native-manager-cl
 import { isValidSharedAISettings } from '../../src/shared/ai-config.ts'
 import { isValidTranslationSettings, type TranslationSettings } from '../../src/shared/translation-contracts.ts'
 import { normalizeSearchEngines } from '../../src/shared/search-providers'
-import type { AppSettings, ThemePreference } from '../../src/shared/domain'
+import type { AppSettings, PluginFeatureShortcut, ThemePreference } from '../../src/shared/domain'
 import type { IpcResult } from '../../src/shared/ipc'
 import { createManagerInvokeRegistry, type IpcSenderContext, type ManagerInvokeRegistry } from './window-security.ts'
 import { parseSuperPanelSettings, type SuperPanelSettings, type SuperPanelSettingsStatus } from '../../src/shared/super-panel-settings.ts'
@@ -68,6 +68,15 @@ export function registerSettingsIpcHandlers(ipc: ManagerInvokeRegistry, deps: {
       if (settings.everythingEsPath !== undefined && (typeof settings.everythingEsPath !== 'string' || settings.everythingEsPath.length > 1000 || (settings.everythingEsPath && (!isAbsolute(settings.everythingEsPath) || basename(settings.everythingEsPath).toLocaleLowerCase() !== 'es.exe')))) return fail('INVALID_SETTINGS', 'ES 路径必须指向绝对路径下的 es.exe。')
       if (settings.sharedAI !== undefined && !isValidSharedAISettings(settings.sharedAI)) return fail('INVALID_AI_SETTINGS', 'AI 提供方配置无效。')
       if (settings.translation !== undefined && !isValidTranslationSettings(settings.translation)) return fail('INVALID_TRANSLATION_SETTINGS', '翻译设置无效。')
+      if (settings.pluginFeatureShortcuts !== undefined && (!Array.isArray(settings.pluginFeatureShortcuts)
+        || settings.pluginFeatureShortcuts.length > 2000
+        || !settings.pluginFeatureShortcuts.every((item: unknown) => isRecord(item)
+          && typeof item.pluginId === 'string' && item.pluginId.length >= 3 && item.pluginId.length <= 128
+          && typeof item.featureId === 'string' && item.featureId.length >= 1 && item.featureId.length <= 64
+          && typeof item.shortcut === 'string' && item.shortcut.length >= 1 && item.shortcut.length <= 80
+          && (item.autoCopy === undefined || typeof item.autoCopy === 'boolean')))) {
+        return fail('INVALID_PLUGIN_FEATURE_SHORTCUTS', '插件功能快捷键设置无效。')
+      }
 
       const currentSettings = deps.getSettings?.() ?? dataStore.snapshot().settings
       let searchEngines = currentSettings.searchEngines
@@ -91,6 +100,7 @@ export function registerSettingsIpcHandlers(ipc: ManagerInvokeRegistry, deps: {
       if (settings.defaultSearchEngineId !== undefined || settings.searchEngines !== undefined) nativeUpdate.defaultSearchEngineId = defaultSearchEngineId
       if (settings.everythingEnabled !== undefined) nativeUpdate.everythingEnabled = settings.everythingEnabled as boolean
       if (settings.everythingEsPath !== undefined) nativeUpdate.everythingEsPath = settings.everythingEsPath as string
+      if (settings.pluginFeatureShortcuts !== undefined) nativeUpdate.pluginFeatureShortcuts = settings.pluginFeatureShortcuts as PluginFeatureShortcut[]
 
       const sharedAI = settings.sharedAI === undefined ? currentSettings.sharedAI : structuredClone(settings.sharedAI)
       const customAI = sharedAI.providers.custom
@@ -118,6 +128,7 @@ export function registerSettingsIpcHandlers(ipc: ManagerInvokeRegistry, deps: {
               websiteLayout: settings.websiteLayout === 'list' ? 'list' : settings.websiteLayout === 'grid' ? 'grid' : data.settings.websiteLayout,
               everythingEnabled: deps.updateNativeLauncherSettings ? data.settings.everythingEnabled : typeof settings.everythingEnabled === 'boolean' ? settings.everythingEnabled : data.settings.everythingEnabled,
               everythingEsPath: deps.updateNativeLauncherSettings ? data.settings.everythingEsPath : typeof settings.everythingEsPath === 'string' ? settings.everythingEsPath : data.settings.everythingEsPath,
+              pluginFeatureShortcuts: deps.updateNativeLauncherSettings ? data.settings.pluginFeatureShortcuts : settings.pluginFeatureShortcuts === undefined ? data.settings.pluginFeatureShortcuts : structuredClone(settings.pluginFeatureShortcuts as PluginFeatureShortcut[]),
               sharedAI,
               translation: settings.translation === undefined ? data.settings.translation : structuredClone(settings.translation as TranslationSettings),
               aiBaseUrl: customAI?.baseUrl ?? (settings.sharedAI === undefined && typeof settings.aiBaseUrl === 'string' ? settings.aiBaseUrl : data.settings.aiBaseUrl),
@@ -136,6 +147,7 @@ export function registerSettingsIpcHandlers(ipc: ManagerInvokeRegistry, deps: {
             ...((settings.defaultSearchEngineId !== undefined || settings.searchEngines !== undefined) ? { defaultSearchEngineId: currentSettings.defaultSearchEngineId } : {}),
             ...(settings.everythingEnabled !== undefined ? { everythingEnabled: currentSettings.everythingEnabled } : {}),
             ...(settings.everythingEsPath !== undefined ? { everythingEsPath: currentSettings.everythingEsPath } : {}),
+            ...(settings.pluginFeatureShortcuts !== undefined ? { pluginFeatureShortcuts: currentSettings.pluginFeatureShortcuts } : {}),
           }
           try { await deps.updateNativeLauncherSettings(previousNativeSettings) }
           catch (rollbackError) { console.warn('[settings:update] Native Launcher settings rollback failed', rollbackError) }

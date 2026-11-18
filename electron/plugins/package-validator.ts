@@ -75,8 +75,24 @@ function runtimeCompatibility() {
   return { platform: process.platform, architecture: process.arch, nodeAbi: process.versions.modules }
 }
 
+async function validateMcpToolSchemas(manifest: ValidatedPackageV3['manifest']): Promise<void> {
+  const tools = manifest.features.flatMap(feature => feature.mcpTool ? [feature.mcpTool] : [])
+  if (!tools.length) return
+  const { compileToolSchema } = await import('./mcp-tool-schema.ts')
+  for (const tool of tools) {
+    try {
+      compileToolSchema(tool.inputSchema)
+      if (tool.outputSchema) compileToolSchema(tool.outputSchema)
+    } catch { throw new ManifestV3ValidationError('INVALID_FIELD') }
+  }
+}
+
 export async function validatePackageV3(source: Uint8Array, hostVersion: string): Promise<ValidatedPackageV3> {
-  try { return await validatePackageV3Core(source, hostVersion, runtimeCompatibility()) }
+  try {
+    const validated = await validatePackageV3Core(source, hostVersion, runtimeCompatibility())
+    await validateMcpToolSchemas(validated.manifest)
+    return validated
+  }
   catch (error) {
     if (error instanceof ManifestV3ValidationError) return fail(error.code)
     return fail('UNSAFE_ARCHIVE')
@@ -86,6 +102,7 @@ export async function validatePackageV3(source: Uint8Array, hostVersion: string)
 export async function validatePackageV3ForRuntime(source: Uint8Array, hostVersion: string): Promise<ValidatedRuntimePackageV3> {
   try {
     const validated = await validatePackageV3RuntimeCore(source, hostVersion, runtimeCompatibility())
+    await validateMcpToolSchemas(validated.manifest)
     const snapshot = createValidatedPluginPackageSnapshotV3(validated)
     return Object.freeze({ ...validated, snapshot })
   }

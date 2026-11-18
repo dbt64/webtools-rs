@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, defineComponent, h, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  ChevronDown, Copy, Ellipsis, Globe, Languages, Minus, Puzzle, Settings2, SlidersHorizontal, Square, X,
+  ChevronDown, Ellipsis, Globe, Languages, Minus, Puzzle, Settings2, SlidersHorizontal, Square, X,
 } from '@lucide/vue'
 import logoDark from '@/assets/brand/logo-dark.svg'
 import logoLight from '@/assets/brand/logo-light.svg'
 import FavoritesView from './features/favorites/FavoritesView.vue'
 import WebRuntimeView from './features/plugins/WebRuntimeView.vue'
-import type { NativeManagerIntent } from './shared/ipc'
+import type { ManagerWindowAction, NativeManagerIntent } from './shared/ipc'
 import type { PluginPageDTO } from './shared/plugin-contracts.ts'
 import type { CatalogEntryDTO, PluginRef } from './shared/plugin-catalog-contracts.ts'
 import { catalogCanOpen, catalogInstalledNavigationItems, catalogKey, catalogPresentation, catalogShouldReturnToCenter, isCurrentCatalogRequest } from './features/plugins/catalog-view-model.ts'
@@ -90,7 +90,7 @@ let sectionBeforeWebRuntime: Section = 'plugins'
 let latestWebRuntimeGeneration = -1
 const currentNativeRequestId = ref<string | null>(null)
 const managerMenuOpen = ref(false)
-const managerMaximized = ref(false)
+const managerDetached = ref(false)
 const managerTitlebar = ref<HTMLElement | null>(null)
 const superPanelSettingsFocusRequest = ref<string | undefined>()
 const aiSettingsFocusRequest = ref<string | undefined>()
@@ -115,6 +115,7 @@ const sectionLabel = computed(() => activeSection.value === 'plugins'
 
 onMounted(() => {
   document.addEventListener('pointerdown', closeManagerMenuOnOutside)
+  document.addEventListener('keydown', handleManagerShortcut)
   removeNativeManagerIntentListener = window.desktop.onNativeManagerIntent((intent) => handleNativeManagerIntent(intent))
   removeWebRuntimeListener = window.desktop.webRuntime.onState(status => {
     if (status.generation < latestWebRuntimeGeneration) return
@@ -143,17 +144,25 @@ onBeforeUnmount(() => {
   removeNativeManagerIntentListener?.()
   removeWebRuntimeListener?.()
   document.removeEventListener('pointerdown', closeManagerMenuOnOutside)
+  document.removeEventListener('keydown', handleManagerShortcut)
 })
+
+function handleManagerShortcut(event: KeyboardEvent): void {
+  if (event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key.toLowerCase() === 'd') {
+    event.preventDefault()
+    void performManagerWindowAction('toggle-detach')
+  }
+}
 
 function closeManagerMenuOnOutside(event: PointerEvent): void {
   if (event.target instanceof Node && managerTitlebar.value?.contains(event.target)) return
   managerMenuOpen.value = false
 }
 
-async function performManagerWindowAction(action: 'minimize' | 'toggle-maximize' | 'close'): Promise<void> {
+async function performManagerWindowAction(action: ManagerWindowAction): Promise<void> {
   managerMenuOpen.value = false
   const result = await window.desktop.managerWindow.perform(action).catch(() => null)
-  if (result?.ok) managerMaximized.value = result.data.maximized
+  if (action === 'toggle-detach' && result?.ok) managerDetached.value = !managerDetached.value
 }
 
 function selectManagerMenuSection(section: 'favorites' | 'plugins' | 'settings'): void {
@@ -357,33 +366,32 @@ function returnToPluginCenter(): void {
 <template>
   <div class="app-frame">
     <header ref="managerTitlebar" class="manager-window-titlebar">
-      <div class="manager-titlebar-identity"><span class="manager-titlebar-mark"><img class="brand-logo-dark" :src="logoDark" alt="" /><img class="brand-logo-light" :src="logoLight" alt="" /></span><strong>WebTools</strong></div>
+      <div class="manager-titlebar-identity">
+        <span class="manager-titlebar-app-mark" aria-hidden="true"><img class="brand-logo-dark" :src="logoDark" alt="" /><img class="brand-logo-light" :src="logoLight" alt="" /></span>
+        <strong>WebTools</strong>
+        <button v-if="!managerDetached" class="manager-window-control manager-titlebar-close" type="button" aria-label="关闭 Manager" title="关闭 Manager" @click="performManagerWindowAction('close')"><X :size="17" /></button>
+      </div>
       <div class="manager-titlebar-controls">
         <button class="manager-window-control manager-menu-trigger" type="button" aria-label="Manager 菜单" :aria-expanded="managerMenuOpen" @click="managerMenuOpen = !managerMenuOpen"><Ellipsis :size="19" /></button>
-        <button class="manager-window-control" type="button" aria-label="最小化 Manager" title="最小化" @click="performManagerWindowAction('minimize')"><Minus :size="16" /></button>
-        <button class="manager-window-control" type="button" :aria-label="managerMaximized ? '还原 Manager' : '最大化 Manager'" :title="managerMaximized ? '还原' : '最大化'" @click="performManagerWindowAction('toggle-maximize')"><Copy v-if="managerMaximized" :size="15" /><Square v-else :size="15" /></button>
-        <button class="manager-window-control manager-window-close" type="button" aria-label="关闭 Manager" title="关闭" @click="performManagerWindowAction('close')"><X :size="17" /></button>
+        <span class="manager-titlebar-app-mark" aria-label="WebTools"><img class="brand-logo-dark" :src="logoDark" alt="" /><img class="brand-logo-light" :src="logoLight" alt="" /></span>
+        <template v-if="managerDetached">
+          <button class="manager-window-control" type="button" aria-label="最小化" @click="performManagerWindowAction('minimize')"><Minus :size="17" /></button>
+          <button class="manager-window-control" type="button" aria-label="最大化或还原" @click="performManagerWindowAction('toggle-maximize')"><Square :size="15" /></button>
+          <button class="manager-window-control manager-titlebar-close" type="button" aria-label="关闭 Manager" @click="performManagerWindowAction('close')"><X :size="17" /></button>
+        </template>
       </div>
       <nav v-if="managerMenuOpen" class="manager-window-menu" aria-label="Manager 菜单">
-        <button type="button" @click="selectManagerMenuSection('favorites')"><Globe :size="15" />网址</button>
-        <button type="button" @click="selectManagerMenuSection('plugins')"><Puzzle :size="15" />插件</button>
-        <button type="button" @click="selectManagerMenuSection('settings')"><Settings2 :size="15" />设置</button>
+        <button type="button" role="menuitemcheckbox" :aria-checked="managerDetached" @click="performManagerWindowAction('toggle-detach')">
+          <span class="manager-menu-check" aria-hidden="true"></span><span class="manager-menu-detach-label">分离为独立窗口</span><span class="manager-menu-shortcut">Ctrl+D</span>
+        </button>
         <div class="manager-window-menu-divider"></div>
-        <button type="button" @click="performManagerWindowAction('close')"><X :size="15" />关闭 Manager</button>
+        <button type="button" @click="selectManagerMenuSection('settings')">插件应用设置</button>
+        <div class="manager-window-menu-divider"></div>
+        <button type="button" @click="performManagerWindowAction('exit-background')">退出到后台</button>
+        <button class="manager-window-menu-danger" type="button" @click="performManagerWindowAction('end-run')">结束运行</button>
       </nav>
     </header>
     <aside class="sidebar">
-      <div class="brand-lockup">
-        <div class="brand-mark" aria-hidden="true">
-          <img class="brand-logo brand-logo-dark" :src="logoDark" alt="" />
-          <img class="brand-logo brand-logo-light" :src="logoLight" alt="" />
-        </div>
-        <div>
-          <div class="brand-name">WebTools</div>
-          <div class="brand-caption">个人效率空间</div>
-        </div>
-      </div>
-
       <div class="sidebar-label">工作区</div>
       <nav class="primary-nav" aria-label="主导航">
         <button
@@ -467,19 +475,25 @@ function returnToPluginCenter(): void {
 .translation-handoff-banner > span { min-width: 0; flex: 1; color: var(--muted); }
 .translation-handoff-banner .secondary-button { min-height: 30px; padding: 0 9px; }
 .translation-handoff-banner .text-button { flex: 0 0 auto; }
-.manager-window-titlebar { position: absolute; z-index: 20; inset: 0 0 auto; display: flex; height: 42px; align-items: center; justify-content: space-between; padding-left: 14px; border-bottom: 1px solid var(--manager-border); color: var(--text); background: var(--manager-chrome); -webkit-app-region: drag; }
-.manager-titlebar-identity { display: flex; min-width: 0; align-items: center; gap: 8px; overflow: hidden; }
-.manager-titlebar-mark { display: grid; width: 25px; height: 25px; flex: 0 0 25px; place-items: center; border-radius: 7px; background: #000; }
-.manager-titlebar-mark img { width: 19px; height: 19px; object-fit: contain; }
-.manager-titlebar-identity strong { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.manager-titlebar-controls { display: flex; height: 100%; align-items: center; -webkit-app-region: no-drag; }
-.manager-window-control { display: grid; width: 42px; height: 100%; place-items: center; padding: 0; border: 0; color: var(--muted); background: transparent; cursor: pointer; -webkit-app-region: no-drag; }
+.manager-window-titlebar { position: absolute; z-index: 20; inset: 0 0 auto; display: flex; height: var(--webtools-window-chrome-height); align-items: center; justify-content: space-between; padding: 0 var(--webtools-window-chrome-end-padding) 0 var(--webtools-window-chrome-start-padding); border-bottom: 1px solid var(--webtools-window-chrome-border); color: var(--text); background: var(--webtools-window-chrome-background); -webkit-app-region: drag; }
+.manager-titlebar-identity { display: flex; min-width: 0; max-width: calc(100% - 92px); height: var(--webtools-window-chrome-identity-height); align-items: center; gap: var(--webtools-window-chrome-identity-gap); overflow: hidden; padding: var(--webtools-window-chrome-identity-padding); border-radius: 999px; background: var(--webtools-window-chrome-identity-background); }
+.manager-titlebar-identity strong { min-width: 0; overflow: hidden; font-size: var(--webtools-window-chrome-font-size); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.manager-titlebar-close { flex: none; }
+.manager-titlebar-controls { display: flex; height: 100%; align-items: center; gap: var(--webtools-window-chrome-action-gap); -webkit-app-region: no-drag; }
+.manager-titlebar-app-mark { display: grid; width: var(--webtools-window-chrome-icon-size); height: var(--webtools-window-chrome-icon-size); flex: 0 0 var(--webtools-window-chrome-icon-size); place-items: center; overflow: hidden; border-radius: 5px; background: #000; -webkit-app-region: no-drag; }
+.manager-titlebar-app-mark img { width: 20px; height: 20px; object-fit: contain; }
+.manager-window-control { display: grid; width: var(--webtools-window-chrome-action-size); height: var(--webtools-window-chrome-action-size); place-items: center; padding: 0; border: 0; border-radius: var(--webtools-window-chrome-action-radius); color: var(--muted); background: transparent; cursor: pointer; -webkit-app-region: no-drag; }
 .manager-window-control:hover { color: var(--text); background: var(--hover); }
-.manager-window-close:hover { color: #fff; background: #c42b1c; }
-.manager-window-menu { position: absolute; z-index: 30; top: calc(100% + 5px); right: 138px; display: grid; width: 184px; gap: 2px; padding: 5px; border: 1px solid var(--manager-border); border-radius: 9px; background: var(--manager-page); box-shadow: 0 8px 28px #0003; -webkit-app-region: no-drag; }
-.manager-window-menu button { display: flex; min-height: 34px; align-items: center; gap: 9px; padding: 0 9px; border: 0; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
-.manager-window-menu button:hover { background: var(--hover); }
-.manager-window-menu-divider { height: 1px; margin: 3px 4px; background: var(--manager-border); }
+.manager-titlebar-close:hover { color: #fff; background: #d92d20; }
+.manager-window-menu { position: absolute; z-index: 30; top: 38px; right: 9px; display: grid; width: 224px; gap: 0; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 28px #0003; -webkit-app-region: no-drag; }
+.manager-window-menu button { display: flex; min-height: 34px; align-items: center; justify-content: space-between; padding: 0 9px; border: 0; border-radius: 5px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.manager-window-menu button:hover { background: var(--surface-raised); }
+.manager-menu-check { display: grid; width: 16px; height: 16px; margin-right: 10px; flex: none; place-items: center; border: 1px solid var(--muted); border-radius: 3px; }
+.manager-window-menu [aria-checked="true"] .manager-menu-check::after { content: "✓"; font-size: 12px; line-height: 1; }
+.manager-menu-detach-label { flex: 1; }
+.manager-menu-shortcut { color: var(--muted); }
+.manager-window-menu .manager-window-menu-danger { color: #c62828; }
+.manager-window-menu-divider { height: 1px; margin: 4px 2px; background: var(--line); }
 .plugin-group-heading { display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 0 calc(var(--manager-unit) * .75); margin: calc(var(--manager-unit) * 1.375) 0 calc(var(--manager-unit) * .5); border: 0; border-radius: calc(var(--manager-unit) * .375); color: var(--muted); background: transparent; font-size: var(--manager-font-small); font-weight: 600; text-align: left; cursor: pointer; }
 .plugin-group-heading svg { width: calc(var(--manager-unit) * .9375); height: calc(var(--manager-unit) * .9375); transform: rotate(-90deg); }
 .plugin-group-heading svg.is-expanded { transform: rotate(180deg); }

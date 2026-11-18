@@ -168,21 +168,22 @@ if ($NativeHost -eq "wpf") {
 } else {
     $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
     if (-not $cargoCommand) { throw "cargo.exe was not found; it is required for a Rust host preview installer." }
+    $rustRoot = if (Test-Path -LiteralPath (Join-Path $repoRoot 'native-rs\Cargo.toml')) { Join-Path $repoRoot 'native-rs' } else { $repoRoot }
     Invoke-Checked $cargoCommand.Source @(
         "build", "--locked", "--release", "--features", "production",
-        "--manifest-path", "native-rs\Cargo.toml", "-p", "slint-launcher"
+        "--manifest-path", (Join-Path $rustRoot 'Cargo.toml'), "-p", "slint-launcher"
     )
     $cargoTargetRoot = if ($env:CARGO_TARGET_DIR) {
         if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR }
         else { Join-Path $repoRoot $env:CARGO_TARGET_DIR }
     } else {
-        Join-Path $repoRoot "native-rs\target"
+        Join-Path $rustRoot "target"
     }
     $rustHostExe = Join-Path $cargoTargetRoot "release\slint-launcher.exe"
     if (-not (Test-Path -LiteralPath $rustHostExe -PathType Leaf)) { throw "Rust NativeHost build output is missing: $rustHostExe" }
     Copy-Item -LiteralPath $rustHostExe -Destination $nativeHostExe
     New-Item -ItemType Directory -Path (Join-Path $hostStage 'tools') -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'native-rs\resources\everything') -Destination (Join-Path $hostStage 'tools') -Recurse
+    Copy-Item -LiteralPath (Join-Path $rustRoot 'resources\everything') -Destination (Join-Path $hostStage 'tools') -Recurse
 }
 
 Invoke-Checked $DotnetExe @(

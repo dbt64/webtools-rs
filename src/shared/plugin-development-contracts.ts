@@ -13,6 +13,7 @@ export interface PluginRuntimeDiagnostic {
 }
 
 export interface PluginDevelopmentStatus {
+  readonly reconnectAvailable?: boolean
   readonly enabled: boolean
   readonly connected: boolean
   readonly project?: {
@@ -31,7 +32,8 @@ export interface PluginDevelopmentApi {
   setEnabled(enabled: boolean): Promise<IpcResult<PluginDevelopmentStatus>>
   connectFromDialog(): Promise<IpcResult<PluginDevelopmentStatus>>
   disconnect(): Promise<IpcResult<PluginDevelopmentStatus>>
-  openFeature(featureId: string): Promise<IpcResult<void>>
+  reconnect(): Promise<IpcResult<PluginDevelopmentStatus>>
+  openFeature(featureId: string, invocation?: import('./development-invocation.ts').DevelopmentInvocation): Promise<IpcResult<void>>
   copyDiagnostics(pluginId: string, featureId?: string): Promise<IpcResult<void>>
   onChanged(handler: (status: PluginDevelopmentStatus) => void): () => void
 }

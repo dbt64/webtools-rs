@@ -17,10 +17,14 @@ interface PageLifecycle {
 
 /** Registers only the WebTools bridge, using APIs available to a sandboxed Electron preload. */
 export function registerWebPluginPreload(contextBridge: ContextBridgePort, port: Port, page: PageLifecycle, argv: readonly string[]): void {
-  const capabilityNamespaces: Array<'ai' | 'clipboard'> = []
+  const capabilityNamespaces: Array<'ai' | 'clipboard' | 'windows' | 'files' | 'system'> = []
   if (argv.includes('--webtools-plugin-ai')) capabilityNamespaces.push('ai')
   if (argv.includes('--webtools-plugin-clipboard')) capabilityNamespaces.push('clipboard')
-  const facade = createPluginPreloadFacade(port, capabilityNamespaces)
+  if (argv.includes('--webtools-plugin-windows')) capabilityNamespaces.push('windows')
+  if (argv.includes('--webtools-plugin-system')) capabilityNamespaces.push('system')
+  if (argv.includes('--webtools-plugin-files')) capabilityNamespaces.push('files')
+  const windowId = argv.find(arg => arg.startsWith('--webtools-plugin-window-id='))?.slice('--webtools-plugin-window-id='.length) || 'main'
+  const facade = createPluginPreloadFacade(port, capabilityNamespaces, windowId)
   contextBridge.exposeInMainWorld('__webtoolsPluginBridge', facade)
   const onPageHide = () => facade.dispose()
   page.addEventListener('pagehide', onPageHide, { once: true })

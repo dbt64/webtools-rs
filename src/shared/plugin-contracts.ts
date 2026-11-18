@@ -2,7 +2,7 @@
 export const PLUGIN_CAPABILITIES = ['manager.page', 'plugin.config.read', 'plugin.config.write', 'plugin.storage.read', 'plugin.storage.write', 'external.open', 'clipboard.write', 'sharedAI.complete'] as const
 export type PluginCapability = typeof PLUGIN_CAPABILITIES[number]
 /** Manager install/grant controls cover both formats; the v1 Manifest allowlist remains unchanged. */
-export const INSTALLED_PLUGIN_CAPABILITIES = [...PLUGIN_CAPABILITIES, 'clipboard.read', 'network.domains'] as const
+export const INSTALLED_PLUGIN_CAPABILITIES = [...PLUGIN_CAPABILITIES, 'clipboard.read', 'network.domains', 'plugin.window.manage', 'clipboard.current.read', 'system.file.select', 'system.path.open', 'system.notification', 'system.input.paste', 'system.screen.capture', 'plugin.tasks', 'system.browser.automation', 'system.media.image', 'system.media.transcode'] as const
 export type InstalledPluginCapability = typeof INSTALLED_PLUGIN_CAPABILITIES[number]
 export type PluginJson = null | boolean | number | string | PluginJson[] | { [key: string]: PluginJson }
 export type PluginSettingValue = string | boolean | number
@@ -59,6 +59,7 @@ export interface PluginSummary {
   description?: string; author?: { name: string; url?: string }; api?: { apiMajor: number; minHostVersion: string }
   source: 'local-unsigned'; iconDataUrl?: string
   webFeatures?: PluginFeatureSummary[]
+  mcpToolCount?: number
   /** Presentation only: grants remain controlled by Host, independently of implementation support. */
   unsupportedCapabilities?: InstalledPluginCapability[]
 }

@@ -33,6 +33,20 @@ pub struct AppEntry {
     search: SearchFields,
 }
 
+// LauncherState and existing Manager clients store 16 hexadecimal characters.
+// Native discovery supplies provider/path IDs instead. Normalize at admission,
+// including old native caches, so a successful launch can actually be learned.
+// FNV-1a is a stable identity key here, not a credential or integrity hash.
+fn stable_app_id(id: &str) -> String {
+    if id.len() == 16 && id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return id.to_ascii_lowercase();
+    }
+    let hash = id.to_lowercase().bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{hash:016x}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SearchFields {
     normalized_name: String,
@@ -84,7 +98,7 @@ pub struct Hit {
     pub score: i32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Index {
     pub apps: Vec<AppEntry>,
     pub origin: String,
@@ -777,10 +791,8 @@ fn discover_windows_apps() -> Option<Snapshot> {
                         let Ok(kind) = entry.file_type() else {
                             continue;
                         };
-                        if kind.is_dir() && !kind.is_symlink() {
-                            pending.push(path);
-                            continue;
-                        }
+                        // Desktop folders contain user data and source trees, not an app catalog.
+                        if kind.is_dir() { continue; }
                         if !path
                             .extension()
                             .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
@@ -911,7 +923,7 @@ impl Index {
                 _ => Launch::None,
             };
             let entry = AppEntry {
-                id: app.id,
+                id: stable_app_id(&app.id),
                 name: app.name,
                 aliases: app.aliases,
                 source: app.source,
@@ -1493,6 +1505,99 @@ pub fn launch_entry(app: &AppEntry) -> Result<String, String> {
 }
 
 static GLOBAL: OnceLock<RwLock<Arc<Index>>> = OnceLock::new();
+static REFRESH: OnceLock<std::sync::Mutex<(bool, Option<std::time::Instant>, bool)>> = OnceLock::new();
+static SHORTCUT_NAMES: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+static REMOVED_NAMES: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn begin_refresh(force: bool) -> bool {
+    let mut state = REFRESH.get_or_init(|| std::sync::Mutex::new((false, None, false))).lock().unwrap();
+    if state.0 { if force { state.2 = true; } return false; }
+    if !force && state.1.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(3)) {
+        return false;
+    }
+    state.0 = true;
+    state.1 = Some(std::time::Instant::now());
+    true
+}
+
+fn finish_refresh() -> bool {
+    let mut state = REFRESH.get().unwrap().lock().unwrap();
+    if state.2 { state.2 = false; return true; }
+    state.0 = false;
+    false
+}
+
+/// Re-scan in the background after a user starts searching; coalesce rapid keystrokes.
+pub fn request_refresh(profile: std::path::PathBuf, ready: impl FnMut() + Send + 'static) {
+    request_refresh_impl(profile, ready, false);
+}
+pub(crate) fn invalidate_catalog(profile: std::path::PathBuf, ready: impl FnMut() + Send + 'static) {
+    request_refresh_impl(profile, ready, true);
+}
+fn request_refresh_impl(profile: std::path::PathBuf, mut ready: impl FnMut() + Send + 'static, force: bool) {
+    if !begin_refresh(force) { return; }
+    std::thread::spawn(move || {
+        loop {
+        if refresh_shortcuts() { ready(); }
+        let changed = refresh_catalog(&profile);
+        if changed { refresh_shortcuts(); }
+        if changed { ready(); }
+        if !finish_refresh() { break; }
+        }
+    });
+}
+
+/// Pick up newly installed desktop shortcuts promptly while the full shell catalog scans.
+pub(crate) fn shortcut_roots() -> Vec<std::path::PathBuf> {
+    use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_PublicDesktop, FOLDERID_Programs, FOLDERID_CommonPrograms, KF_FLAG_DEFAULT}};
+    let mut paths = Vec::new();
+    for id in [&FOLDERID_Desktop, &FOLDERID_PublicDesktop, &FOLDERID_Programs, &FOLDERID_CommonPrograms] {
+        unsafe {
+            if let Ok(path) = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) {
+                if let Ok(root) = path.to_string() { paths.push(std::path::PathBuf::from(root)); }
+                CoTaskMemFree(Some(path.0.cast()));
+            }
+        }
+    }
+    paths
+}
+
+pub(crate) fn refresh_shortcuts() -> bool {
+    let mut paths: Vec<_> = shortcut_roots().into_iter().enumerate().map(|(i, path)| (path, i >= 2)).collect();
+    let mut found = Vec::new();
+    while let Some((dir, recursive)) = paths.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() { if recursive && !kind.is_symlink() { paths.push((path, true)); } continue; }
+            if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk")) { continue; }
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else { continue };
+            let name = name.to_string();
+            let path = path.to_string_lossy().into_owned();
+            found.push(AppEntry { id: stable_app_id(&format!("desktop:{path}")), name: name.clone(), aliases: Vec::new(), source: "start-apps".into(), launch: Launch::Shortcut { path, arguments: String::new(), working_directory: String::new() }, icon_reference: String::new(), search: SearchFields::new(&name, &[], "") });
+        }
+    }
+    let current: std::collections::HashSet<String> = found.iter().map(|entry| entry.name.to_lowercase()).collect();
+    let mut previous = SHORTCUT_NAMES.get_or_init(Default::default).lock().unwrap();
+    let mut removed = REMOVED_NAMES.get_or_init(Default::default).lock().unwrap();
+    removed.extend(previous.difference(&current).cloned());
+    removed.retain(|name| !current.contains(name));
+    *previous = current;
+    let Some(global) = GLOBAL.get() else { return false };
+    let mut guard = global.write().unwrap();
+    let mut next = (**guard).clone();
+    let before = next.apps.len();
+    next.apps.retain(|entry| (entry.source == "system" || !removed.contains(&entry.name.to_lowercase())) && match &entry.launch {
+        Launch::Shortcut { path, .. } | Launch::Executable(path) => std::path::Path::new(path).is_file(),
+        _ => true,
+    });
+    let mut changed = before != next.apps.len();
+    let mut names: std::collections::HashSet<String> = next.apps.iter().map(|entry| entry.name.to_lowercase()).collect();
+    for entry in found { if names.insert(entry.name.to_lowercase()) { next.apps.push(entry); changed = true; } }
+    if changed { *guard = Arc::new(next); }
+    changed
+}
 
 pub fn global() -> Arc<Index> {
     GLOBAL.get_or_init(|| RwLock::new(Arc::new(Index::load())))
@@ -1506,26 +1611,43 @@ pub fn try_global() -> Option<Arc<Index>> {
 pub fn load_and_refresh(profile: &std::path::Path, mut ready: impl FnMut()) {
     let path = profile.join("rust-app-index-v1.json");
     let cached = std::fs::read(&path).ok()
-        .and_then(|data| serde_json::from_slice::<Index>(&data).ok());
+        .and_then(|data| serde_json::from_slice::<Index>(&data).ok())
+        .map(|mut index| {
+            for app in &mut index.apps { app.id = stable_app_id(&app.id); }
+            index
+        });
     let initial = cached.unwrap_or_else(|| Index::from_snapshot(
         Snapshot { schema_version: 1, apps: system_apps() }, "Windows system apps"));
     GLOBAL.get_or_init(|| RwLock::new(Arc::new(initial)));
+    refresh_shortcuts();
     ready();
+    if begin_refresh(false) {
+        loop {
+        let refreshed = refresh_catalog(profile);
+        if refreshed { ready(); }
+        if !finish_refresh() { break; }
+        }
+    }
+}
+
+fn refresh_catalog(profile: &std::path::Path) -> bool {
     if let Some(snapshot) = discover_windows_apps() {
-        let refreshed = Index::from_snapshot(snapshot, "Windows AppsFolder");
+        let mut refreshed = Index::from_snapshot(snapshot, "Windows AppsFolder");
+        if let Some(removed) = REMOVED_NAMES.get() {
+            let removed = removed.lock().unwrap();
+            refreshed.apps.retain(|entry| entry.source == "system" || !removed.contains(&entry.name.to_lowercase()));
+        }
         let data = serde_json::to_vec(&refreshed).ok();
         if let Some(global) = GLOBAL.get() {
             *global.write().unwrap() = Arc::new(refreshed);
         }
-        ready();
         if let Some(data) = data {
             let _ = std::fs::create_dir_all(profile);
-            let temporary = path.with_extension("json.tmp");
-            if std::fs::write(&temporary, data).is_ok() {
-                let _ = std::fs::rename(temporary, path);
-            }
+            let _ = std::fs::write(profile.join("rust-app-index-v1.json"), data);
         }
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -1533,12 +1655,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn discovered_app_ids_can_be_remembered_and_reloaded() {
+        let mut store = webtools_ipc::state::LauncherStateStore::memory();
+        for (id, name) in [("desktop:C:\\Tools\\Alpha.lnk", "Alpha"),
+            ("apps-folder:org.example.beta", "Beta"), ("app-path:gamma.exe", "Gamma"),
+            ("system:control-panel", "Control Panel"), ("3a53845702b1a8f6", "Legacy")] {
+            let json = serde_json::json!({"schemaVersion":1,"apps":[{"id":id,"name":name,"aliases":[],"source":"start-apps","target":{"kind":"executable","path":"C:\\Tools\\app.exe"}}]});
+            let index = Index::from_json(&json.to_string(), "test").unwrap();
+            let app = &index.apps[0];
+            store.remember(name, &app.id).expect("every discovered app must use a persistable search identity");
+            let cached: Index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+            assert_eq!(store.remembered(name).as_deref(), Some(cached.apps[0].id.as_str()));
+            if id.len() == 16 { assert_eq!(app.id, id); }
+        }
+    }
+
+    #[test]
+    #[ignore = "creates and removes one temporary desktop shortcut to validate live notifications"]
+    fn catalog_watch_adds_and_removes_without_search_or_restart() {
+        let root = shortcut_roots().into_iter().next().unwrap();
+        let marker = format!("WebToolsLiveProbe{}", std::process::id());
+        let shortcut = root.join(format!("{marker}.lnk"));
+        assert!(!shortcut.exists());
+        let profile = std::env::temp_dir().join(&marker);
+        load_and_refresh(&profile, || {});
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let watch = crate::catalog_watch::start(move || { refresh_shortcuts(); let _ = sender.send(()); });
+        receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        std::fs::write(&shortcut, b"temporary catalog fixture").unwrap();
+        let added = (|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                receiver.recv_timeout(std::time::Duration::from_secs(1)).ok();
+                if !global().search(&marker, 10).is_empty() { return true; }
+            }
+            false
+        })();
+        std::fs::remove_file(&shortcut).unwrap();
+        let removed = (|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                receiver.recv_timeout(std::time::Duration::from_secs(1)).ok();
+                if global().search(&marker, 10).is_empty() { return true; }
+            }
+            false
+        })();
+        drop(watch);
+        let _ = std::fs::remove_dir_all(profile);
+        assert!(added, "new shortcut was not picked up by notifications");
+        assert!(removed, "deleted shortcut remained searchable");
+    }
+
+    #[test]
+    fn refresh_discovers_new_desktop_shortcut_without_restarting() {
+        use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, KF_FLAG_DEFAULT}};
+        let root = unsafe {
+            let path = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None).unwrap();
+            let result = std::path::PathBuf::from(path.to_string().unwrap());
+            CoTaskMemFree(Some(path.0.cast()));
+            result
+        };
+        let marker = format!("WebToolsRefreshProbe{}", std::process::id());
+        let shortcut = root.join(format!("{marker}.lnk"));
+        assert!(!shortcut.exists());
+        let profile = std::env::temp_dir().join(format!("webtools-index-test-{}", std::process::id()));
+        load_and_refresh(&profile, || {});
+        assert!(global().search(&marker, 10).is_empty());
+        std::fs::write(&shortcut, b"temporary catalog fixture").unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // The startup scan is coalesced for three seconds; no process restart is involved.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        request_refresh(profile.clone(), move || { let _ = sender.send(()); });
+        let refreshed = receiver.recv_timeout(std::time::Duration::from_secs(30));
+        let found = !global().search(&marker, 10).is_empty();
+        let _ = std::fs::remove_file(shortcut);
+        let _ = std::fs::remove_dir_all(profile);
+        refreshed.expect("catalog refresh did not complete");
+        assert!(found, "new desktop shortcut must be searchable");
+    }
+
+    #[test]
     fn cached_catalog_preserves_search_and_launch_data() {
         let source = Index::from_json(r#"{"schemaVersion":1,"apps":[{"id":"demo","name":"微信","source":"desktop","aliases":[],"target":{"kind":"executable","path":"C:\\demo.exe"}}]}"#, "test").unwrap();
         let bytes = serde_json::to_vec(&source).unwrap();
         let restored: Index = serde_json::from_slice(&bytes).unwrap();
         let hit = restored.search("wx", 8).into_iter().next().unwrap();
-        assert_eq!(restored.apps[hit.index].id, "demo");
+        assert_eq!(restored.apps[hit.index].id, source.apps[0].id);
         assert_eq!(restored.command(hit.index).as_deref(), Some(r"C:\demo.exe"));
     }
 

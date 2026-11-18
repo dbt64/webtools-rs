@@ -14,7 +14,7 @@ interface BridgeOptions {
 interface Pending {
   event: unknown
   controller: AbortController
-  timer: ReturnType<typeof setTimeout>
+  timer?: ReturnType<typeof setTimeout>
   deadline: number
   work?: Promise<void>
 }
@@ -108,9 +108,9 @@ export class WebPluginBridge {
     }
     if (this.pending.size >= 4) { this.reply(id, 'LIMIT_EXCEEDED'); return }
     const controller = new AbortController()
-    const timeout = capability?.method === 'ai.complete' ? 60_000 : 30_000
+    const timeout = capability?.method === 'files.select' || capability?.method === 'tasks.request' ? Infinity : capability?.method === 'ai.complete' ? 60_000 : 30_000
     const entry: Pending = { event, controller, deadline: this.now() + timeout,
-      timer: setTimeout(() => this.finish(id, entry, 'TIMEOUT'), timeout) }
+      timer: Number.isFinite(timeout) ? setTimeout(() => this.finish(id, entry, 'TIMEOUT'), timeout) : undefined }
     this.pending.set(id, entry)
     entry.work = Promise.resolve().then(() => {
       if (this.closed || this.pending.get(id) !== entry || this.authenticate(event) !== 'current') return null
@@ -178,6 +178,25 @@ export class WebPluginBridge {
   private send(message: HostMessage): void {
     if (this.closed) return
     try { this.options.send(encodeMessage(message, 'host')) } catch { this.fatal('host-send-failed') }
+  }
+  publishEvent(event: 'tasks.trigger', payload: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger): void
+  publishEvent(event: 'subInput.change', payload: { value: string; revision: number }): void
+  publishEvent(event: 'lifecycle.changed', payload: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').PluginLifecycleEvent): void
+  publishEvent(event: 'context.changed', payload: null): void
+  publishEvent(event: 'search.result-selected', payload: { id: string; query: string; revision: number; item: { id: string; title: string; description: string; icon: string } }): void
+  publishEvent(event: 'window.message', payload: { from: string; data: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').JsonValue }): void
+  publishEvent(event: 'window.closed', payload: { id: string }): void
+  publishEvent(event: 'tasks.trigger' | 'subInput.change' | 'search.result-selected' | 'context.changed' | 'lifecycle.changed' | 'window.message' | 'window.closed', payload: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger | import('../../plugin-sdk/declarative-v1/web/protocol.mjs').PluginLifecycleEvent | { value: string; revision: number } | { id: string; query: string; revision: number; item: { id: string; title: string; description: string; icon: string } } | { from: string; data: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').JsonValue } | { id: string } | null): void {
+    if (event === 'tasks.trigger') { this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger }); return }
+    if (event === 'window.message') { this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as { from: string; data: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').JsonValue } }); return }
+    if (event === 'window.closed') { this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as { id: string } }); return }
+    if (event === 'lifecycle.changed') { this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as import('../../plugin-sdk/declarative-v1/web/protocol.mjs').PluginLifecycleEvent }); return }
+    if (event === 'context.changed') { this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: null }); return }
+    if (event === 'subInput.change') {
+      this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as { value: string; revision: number } })
+      return
+    }
+    this.send({ type: 'event', protocolMajor: BRIDGE_MAJOR, event, payload: payload as { id: string; query: string; revision: number; item: { id: string; title: string; description: string; icon: string } } })
   }
   private authenticate(event: unknown): 'current' | 'invalid' | 'unrelated' {
     try { return this.options.authenticate(event) } catch { return 'invalid' }

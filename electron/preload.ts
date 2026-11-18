@@ -4,6 +4,10 @@ import { IPC_CHANNELS, type DesktopApi } from '../src/shared/ipc'
 import { parseSuperPanelSettingsStatus } from '../src/shared/super-panel-settings.ts'
 
 const desktopApi: DesktopApi = {
+  pluginTasks: {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.pluginTasksList),
+    remove: (pluginId, code) => ipcRenderer.invoke(IPC_CHANNELS.pluginTasksRemove, pluginId, code),
+  },
   superPanel: {
     get: () => ipcRenderer.invoke(IPC_CHANNELS.superPanelGet),
     update: settings => ipcRenderer.invoke(IPC_CHANNELS.superPanelUpdate, settings),
@@ -16,12 +20,22 @@ const desktopApi: DesktopApi = {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.superPanelChanged, listener)
     },
   },
+  pluginMcp: {
+    setPluginEnabled: (id, enabled) => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpPluginEnabled, id, enabled),
+    preferences: () => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpPreferences),
+    agents: () => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpAgents),
+    configureAgent: id => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpConfigureAgent, id),
+    listTools: () => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpTools),
+    get: () => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpGet),
+    setEnabled: enabled => ipcRenderer.invoke(IPC_CHANNELS.pluginMcpSetEnabled, enabled),
+  },
   pluginDevelopment: {
     get: () => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentGet),
     setEnabled: enabled => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentSetEnabled, enabled),
     connectFromDialog: () => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentConnect),
     disconnect: () => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentDisconnect),
-    openFeature: featureId => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentOpen, featureId),
+    openFeature: (featureId, invocation) => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentOpen, featureId, invocation),
+    reconnect: () => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentReconnect),
     copyDiagnostics: (pluginId, featureId) => ipcRenderer.invoke(IPC_CHANNELS.pluginDevelopmentCopy, pluginId, featureId),
     onChanged: handler => {
       const listener = (_event: Electron.IpcRendererEvent, value: Parameters<typeof handler>[0]) => handler(value)

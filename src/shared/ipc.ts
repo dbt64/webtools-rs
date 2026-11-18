@@ -2,6 +2,13 @@ import type { AppSettings, BookmarkFolder, WebsiteCollection, WebsiteEntry, Webs
 import type { AIProviderId } from './ai-config.ts'
 import type { TranslationProviderInfo, TranslationRequest, TranslationResult } from './translation-contracts.ts'
 import type { PluginApi } from './plugin-contracts.ts'
+
+export type { McpGatewayStatus as PluginMcpStatus } from './plugin-mcp-contracts.ts'
+import type { McpGatewayStatus as PluginMcpStatus } from './plugin-mcp-contracts.ts'
+export type ManagedScheduledTask = import('../../plugin-sdk/declarative-v1/web/index').ScheduledTask & {
+  pluginName: string
+  logs?: readonly { executeAtMs: number; durationMs: number; success: boolean; error: string | null }[]
+}
 import type { PluginCatalogApi } from './plugin-catalog-contracts.ts'
 import type { PluginDevelopmentApi } from './plugin-development-contracts.ts'
 import type { SuperPanelSettings, SuperPanelSettingsStatus } from './super-panel-settings.ts'
@@ -30,6 +37,10 @@ export interface AIProviderStatus {
 }
 
 export interface DesktopApi {
+  pluginTasks: {
+    list(): Promise<IpcResult<ManagedScheduledTask[]>>
+    remove(pluginId: string, code: string): Promise<IpcResult<boolean>>
+  }
   superPanel: {
     get(): Promise<IpcResult<SuperPanelSettingsStatus>>
     update(settings: SuperPanelSettings): Promise<IpcResult<SuperPanelSettingsStatus>>
@@ -38,6 +49,12 @@ export interface DesktopApi {
   pluginCatalog: PluginCatalogApi
   plugins: PluginApi
   pluginDevelopment: PluginDevelopmentApi
+  pluginMcp: {
+    setPluginEnabled(pluginId: string, enabled: boolean): Promise<IpcResult<null>>
+    agents(): Promise<IpcResult<Array<{ id: string; name: string; path: string; configured: boolean }>>>
+    configureAgent(id: string): Promise<IpcResult<null>>
+    preferences(): Promise<IpcResult<{ disabledPlugins: string[] }>>
+    get(): Promise<IpcResult<PluginMcpStatus>>; setEnabled(enabled: boolean): Promise<IpcResult<PluginMcpStatus>>; listTools(): Promise<IpcResult<Array<{ pluginId: string; featureId: string; title: string; description: string }>>> }
 
   managerReady(): void
   managerWindow: {
@@ -77,7 +94,7 @@ export interface DesktopApi {
   }
 }
 
-export type ManagerWindowAction = 'minimize' | 'toggle-maximize' | 'close'
+export type ManagerWindowAction = 'toggle-detach' | 'minimize' | 'toggle-maximize' | 'close' | 'exit-background' | 'end-run'
 
 export type NativeManagerIntent =
   | { requestId: string; kind: 'open-plugin'; ref: import('./plugin-catalog-contracts.ts').PluginRef }
@@ -86,14 +103,24 @@ export type NativeManagerIntent =
   | { requestId: string; kind: 'open-page'; section: 'favorites' | 'entries' | 'settings'; settingsSection?: 'super-panel' }
 
 export const IPC_CHANNELS = {
+  pluginTasksList: 'plugin-tasks:list',
+  pluginTasksRemove: 'plugin-tasks:remove',
   superPanelGet: 'settings:super-panel-get',
   superPanelUpdate: 'settings:super-panel-update',
   superPanelChanged: 'settings:super-panel-changed',
+  pluginMcpPluginEnabled: 'plugin-mcp:plugin-enabled',
+  pluginMcpPreferences: 'plugin-mcp:preferences',
+  pluginMcpAgents: 'plugin-mcp:agents',
+  pluginMcpConfigureAgent: 'plugin-mcp:configure-agent',
+  pluginMcpTools: 'plugin-mcp:tools',
+  pluginMcpGet: 'plugin-mcp:get',
+  pluginMcpSetEnabled: 'plugin-mcp:set-enabled',
   pluginDevelopmentGet: 'plugin-development:get',
   pluginDevelopmentSetEnabled: 'plugin-development:set-enabled',
   pluginDevelopmentConnect: 'plugin-development:connect-project',
   pluginDevelopmentDisconnect: 'plugin-development:disconnect',
   pluginDevelopmentOpen: 'plugin-development:open-feature',
+  pluginDevelopmentReconnect: 'plugin-development:reconnect',
   pluginDevelopmentCopy: 'plugin-development:copy-diagnostics',
   pluginDevelopmentChanged: 'plugin-development:changed',
   pluginCatalogList: 'plugin-catalog:list',

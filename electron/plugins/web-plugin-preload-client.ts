@@ -6,14 +6,16 @@ interface Port { send(raw: string): void; listen(listener: (raw: unknown) => voi
 const failure = (code: BridgeErrorCode): Outcome & { ok: false } => ({ ok: false, error: { code, retryable: false } })
 
 /** Trusted preload owns IDs. The exposed cancel closure captures its ID privately. */
-export function createPluginPreloadFacade(port: Port, capabilityNamespaces: readonly ('ai' | 'clipboard')[] = []) {
+export function createPluginPreloadFacade(port: Port, capabilityNamespaces: readonly ('ai' | 'clipboard' | 'windows' | 'files' | 'system')[] = [], windowId = 'main') {
   let nextId = 1
   let accepted = false
   let closed = false
   let resolveReady!: (outcome: ReadyOutcome) => void
   const ready = new Promise<ReadyOutcome>(resolve => { resolveReady = resolve })
   const listeners = new Set<() => void>()
-  const pending = new Map<string, { resolve: (value: Outcome) => void; timer: ReturnType<typeof setTimeout> }>()
+  const eventListeners = new Map<string, Set<(payload: unknown) => void>>()
+  const lifecycleState = new Map<string, unknown>()
+  const pending = new Map<string, { resolve: (value: Outcome) => void; timer?: ReturnType<typeof setTimeout> }>()
   let unlisten = () => {}
   function finish(id: string, outcome: Outcome): boolean {
     const entry = pending.get(id)
@@ -29,6 +31,8 @@ export function createPluginPreloadFacade(port: Port, capabilityNamespaces: read
     for (const id of pending.keys()) finish(id, failure(code))
     for (const listener of listeners) { try { listener() } catch { /* Plugin-local listener failure cannot retain the transport. */ } }
     listeners.clear()
+    eventListeners.clear()
+    lifecycleState.clear()
   }
   unlisten = port.listen(raw => {
     if (closed) return
@@ -39,19 +43,34 @@ export function createPluginPreloadFacade(port: Port, capabilityNamespaces: read
       if (message.type === 'ready') {
         if (!message.accepted) { dispose(message.error.code); return }
         accepted = true; resolveReady({ accepted: true })
+      } else if (accepted && message.type === 'event') {
+        if (message.event === 'lifecycle.changed') lifecycleState.set(message.payload.phase === 'enter' ? 'enter' : 'visibility', message.payload)
+        for (const listener of [...(eventListeners.get(message.event) ?? [])]) {
+          try { listener(message.payload) } catch { /* A plugin event callback cannot break transport delivery. */ }
+        }
       } else if (accepted && message.type === 'response') {
         finish(message.requestId, message.ok ? { ok: true, result: message.result } : failure(message.error.code))
       }
     } catch { dispose('INTERNAL_ERROR') }
   })
   const facade = Object.freeze({
-    capabilityNamespaces: Object.freeze([...new Set(capabilityNamespaces.filter(name => name === 'ai' || name === 'clipboard'))]),
+    capabilityNamespaces: Object.freeze([...new Set(capabilityNamespaces.filter(name => name === 'ai' || name === 'clipboard' || name === 'windows' || name === 'files' || name === 'system'))]),
+    windowId,
     getReady: () => ready,
     onClose: (listener: () => void) => {
       if (typeof listener !== 'function') throw new TypeError('Invalid close listener')
       if (closed) { listener(); return () => {} }
       listeners.add(listener)
       return () => { listeners.delete(listener) }
+    },
+    onEvent: (event: string, listener: (payload: unknown) => void) => {
+      if (typeof listener !== 'function' || !['tasks.trigger', 'subInput.change', 'search.result-selected', 'context.changed', 'lifecycle.changed', 'window.message', 'window.closed'].includes(event)) throw new TypeError('Invalid plugin event listener')
+      if (closed) return () => {}
+      const subscriptions = eventListeners.get(event) ?? new Set()
+      if (subscriptions.size >= 8) throw new Error('Search event listener limit reached')
+      subscriptions.add(listener); eventListeners.set(event, subscriptions)
+      if (event === 'lifecycle.changed') for (const payload of lifecycleState.values()) listener(payload)
+      return () => { subscriptions.delete(listener); if (!subscriptions.size) eventListeners.delete(event) }
     },
     submit: (method: string, payload: JsonValue) => {
       const unavailable = (code: BridgeErrorCode) => Object.freeze({ response: Promise.resolve(failure(code)), cancel: () => {} })
@@ -73,10 +92,10 @@ export function createPluginPreloadFacade(port: Port, capabilityNamespaces: read
         if (!finish(id, failure('CANCELLED'))) return
         try { port.send(encodeMessage({ type: 'cancel', protocolMajor: BRIDGE_MAJOR, requestId: id }, 'client')) } catch { /* Best-effort cancellation never reopens the local call. */ }
       }
-      const deadline = setTimeout(() => {
+      const deadline = method === 'files.select' || method === 'tasks.request' ? undefined : setTimeout(() => {
         if (!finish(id, failure('TIMEOUT'))) return
         try { port.send(encodeMessage({ type: 'cancel', protocolMajor: BRIDGE_MAJOR, requestId: id }, 'client')) } catch {}
-      }, method === 'ai.complete' ? 60_000 : 30_000)
+      }, method === 'system.mediaTranscode' ? 180_000 : method === 'ai.complete' ? 60_000 : 30_000)
       pending.set(id, { resolve, timer: deadline })
       try { port.send(raw) } catch { finish(id, failure('INTERNAL_ERROR')) }
       return Object.freeze({ response, cancel })

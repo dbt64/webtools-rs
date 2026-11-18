@@ -72,12 +72,18 @@ export class PluginRuntimeSession {
     current.on('will-download', (_event, item, contents) => {
       const owner = ownerFor(contents)
       if (!owner?.current() || owner.snapshot.manifest.manifestVersion !== 3) { item.cancel(); return }
-      item.pause()
       const name = item.getFilename().replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').slice(0, 180) || 'download'
-      void this.withHostDialog(owner.window, () => dialog.showSaveDialog(owner.window, { title: '保存插件下载', defaultPath: name })).then(result => {
-        if (result.canceled || !result.filePath || !owner.current()) { item.cancel(); return }
-        item.setSavePath(result.filePath); item.resume()
-      }, () => item.cancel())
+      // Electron chooses its own save dialog when no path is set before this
+      // event returns. Choose the destination synchronously to avoid two dialogs.
+      try {
+        let filePath: string | undefined
+        void this.withHostDialog(owner.window, () => {
+          filePath = dialog.showSaveDialogSync(owner.window, { title: '保存插件下载', defaultPath: name })
+          return Promise.resolve()
+        }).catch(() => item.cancel())
+        if (!filePath || !owner.current()) { item.cancel(); return }
+        item.setSavePath(filePath)
+      } catch { item.cancel() }
     })
     current.protocol.handle('webtools-plugin', async request => {
       let host: string

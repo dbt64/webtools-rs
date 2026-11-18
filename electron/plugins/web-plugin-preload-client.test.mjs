@@ -85,3 +85,26 @@ test('preload dispose clears timers/correlation/subscriptions and stale delivery
   assert.equal((await h.facade.submit('bridge.ping', null).response).error.code, 'RUNTIME_CLOSED')
   assert.equal(h.sent.length, sent)
 })
+
+
+test('late SDK connection receives the current enter and visibility, with no replay after close', async () => {
+  const { encodeMessage } = await import('../../plugin-sdk/declarative-v1/web/protocol.mjs')
+  const { createBridgeConnection } = await import('../../plugin-sdk/declarative-v1/web/bridge-client.mjs')
+  const h = harness()
+  h.deliver('{"type":"ready","protocolMajor":1,"accepted":true}')
+  const event = (phase, entryCount) => h.deliver(encodeMessage({ type: 'event', protocolMajor: 1, event: 'lifecycle.changed',
+    payload: { phase, entryCount, generation: 3, featureId: 'home' } }, 'host'))
+  event('enter', 1); event('show', 1); event('hide', 1)
+  const { publicClient: api } = createBridgeConnection(h.facade)
+  const received = []
+  api.lifecycle.onEnter(value => received.push(value.entryCount))
+  let hidden = 0; api.lifecycle.onHide(() => hidden++)
+  await api.ready
+  assert.deepEqual(received, [1])
+  assert.equal(hidden, 1)
+  event('enter', 2)
+  assert.deepEqual(received, [1, 2])
+  h.deliver('{"type":"runtime-closed","protocolMajor":1}')
+  api.lifecycle.onEnter(() => assert.fail('closed runtime must not replay retained state'))
+  assert.equal(h.disposed(), true)
+})

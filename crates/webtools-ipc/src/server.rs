@@ -18,9 +18,18 @@ pub struct PipeServer {
 impl PipeServer {
     /// Bound the wait for a Manager connection and allow application shutdown.
     pub fn accept_until(
+        self,
+        cancelled: &std::sync::atomic::AtomicBool,
+        timeout: std::time::Duration,
+    ) -> io::Result<Connection> {
+        self.accept_until_with_tick(cancelled, timeout, || true)
+    }
+    /// Service bounded background work while waiting; false abandons this startup.
+    pub fn accept_until_with_tick(
         mut self,
         cancelled: &std::sync::atomic::AtomicBool,
         timeout: std::time::Duration,
+        mut tick: impl FnMut() -> bool,
     ) -> io::Result<Connection> {
         use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_NOWAIT};
         let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
@@ -32,7 +41,7 @@ impl PipeServer {
         }
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            if cancelled.load(std::sync::atomic::Ordering::SeqCst) || !tick() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "host stopping"));
             }
             let connected = unsafe { ConnectNamedPipe(self.handle as _, std::ptr::null_mut()) };

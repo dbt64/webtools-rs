@@ -8,6 +8,101 @@ import { runtimeV3Manifest, runtimeV3Package } from './fixtures.mjs'
 import { WebHostCapabilities } from './web-host-capabilities.ts'
 
 const caps = ['plugin.storage.read', 'plugin.storage.write', 'sharedAI.complete', 'clipboard.write']
+
+test('workflow capabilities enforce grants, gestures and dispose their browser lifetime', async t => {
+  let lifetime
+  const effects = { browserOpen: async (_pluginId, _url, signal) => { lifetime = signal; return { id: 'owned-browser' } } }
+  const env = await setup(t, effects, ['system.browser.automation'])
+  assert.deepEqual(await env.call('system.browserOpen', { url: 'https://example.com' }), { id: 'owned-browser' })
+  assert.equal(lifetime.aborted, false)
+  await env.manager.setEnabled(env.m.id, false, env.manager.session)
+  assert.equal(lifetime.aborted, true)
+  const denied = await setup(t, effects, [])
+  await assert.rejects(() => denied.call('system.browserOpen', { url: 'https://example.com' }), e => e.code === 'PERMISSION_DENIED')
+  const background = await setup(t, { ...effects, hasForegroundGesture: () => false }, ['system.browser.automation'])
+  await assert.rejects(() => background.call('system.browserOpen', { url: 'https://example.com' }), e => e.code === 'USER_CANCELLED')
+  const imageDenied = await setup(t, { imageTransform: () => assert.fail('must not decode') }, [])
+  await assert.rejects(() => imageDenied.call('system.imageTransform', { dataUrl: 'data:image/png;base64,AAAA', width: 10, format: 'png', quality: 85 }), e => e.code === 'PERMISSION_DENIED')
+})
+test('scheduled tasks bind host identity and require explicit confirmation before persistence', async t => {
+  const calls = []
+  const env = await setup(t, { scheduledTasks: async (...args) => { calls.push(args); return { ...args[3], pluginId: args[1] } } }, ['plugin.tasks'])
+  const request = { code: 'reminder', description: 'Run reminder', schedule: { kind: 'once', atMs: Date.now() + 30000 } }
+  assert.equal((await env.call('tasks.request', request)).code, 'reminder')
+  assert.equal(env.prompts[0].kind, 'schedule'); assert.match(env.prompts[0].preview, /reminder/)
+  assert.equal(calls[0][1], env.m.id); assert.equal(calls[0][2], env.m.features[0].id)
+  const cancelled = await setup(t, { confirm: async () => false, scheduledTasks: async () => { assert.fail('must not persist rejected task') } }, ['plugin.tasks'])
+  await assert.rejects(() => cancelled.call('tasks.request', request), e => e.code === 'USER_CANCELLED')
+  const background = await setup(t, { hasForegroundGesture: () => false, scheduledTasks: async () => null }, ['plugin.tasks'])
+  await assert.rejects(() => background.call('tasks.request', request), e => e.code === 'USER_CANCELLED')
+  await env.manager.setEnabled(env.m.id, false, env.manager.session)
+  await assert.rejects(() => env.call('tasks.list', null), e => ['STALE_RUNTIME', 'CANCELLED'].includes(e.code))
+})
+test('paste sends text to the original application only with permission and a foreground user gesture', async t => {
+  const sent = []
+  const env = await setup(t, { pasteText: async text => sent.push(text) }, ['system.input.paste'])
+  assert.equal(await env.call('system.pasteText', { text: 'Hello 中文' }), null)
+  assert.deepEqual(sent, ['Hello 中文'])
+  const denied = await setup(t, { pasteText: async () => {} }, [])
+  await assert.rejects(() => denied.call('system.pasteText', { text: 'x' }), e => e.code === 'PERMISSION_DENIED')
+  const background = await setup(t, { pasteText: async () => {}, hasForegroundGesture: () => false }, ['system.input.paste'])
+  await assert.rejects(() => background.call('system.pasteText', { text: 'x' }), e => e.code === 'USER_CANCELLED')
+})
+test('system notifications require the declared grant and deliver title and body', async t => {
+  const notifications = []
+  const env = await setup(t, { notify: async (title, body) => notifications.push({ title, body }) }, ['system.notification'])
+  assert.equal(await env.call('system.notify', { title: '验收通知', body: '插件发送的消息' }), null)
+  assert.deepEqual(notifications, [{ title: '验收通知', body: '插件发送的消息' }])
+  const denied = await setup(t, { notify: async () => {} }, [])
+  await assert.rejects(() => denied.call('system.notify', { title: '测试', body: '' }), e => e.code === 'PERMISSION_DENIED')
+})
+test('screen information requires its grant; screen capture also requires a foreground gesture', async t => {
+  const display = { id: 'display-1', label: '主显示器', bounds: { x: 0, y: 0, width: 1920, height: 1080 }, workArea: { x: 0, y: 0, width: 1920, height: 1040 }, scaleFactor: 1, rotation: 0, primary: true }
+  const captures = []
+  const env = await setup(t, { getDisplays: async () => [display], captureScreen: async id => { captures.push(id); return 'data:image/png;base64,iVBORw0KGgo=' } }, ['system.screen.capture'])
+  assert.deepEqual(await env.call('system.getDisplays', null), [display])
+  assert.equal(await env.call('system.captureScreen', { displayId: 'display-1' }), 'data:image/png;base64,iVBORw0KGgo=')
+  assert.deepEqual(captures, ['display-1'])
+  const denied = await setup(t, { getDisplays: async () => [display] }, [])
+  await assert.rejects(() => denied.call('system.getDisplays', null), e => e.code === 'PERMISSION_DENIED')
+  const background = await setup(t, { captureScreen: async () => 'data:image/png;base64,iVBORw0KGgo=', hasForegroundGesture: () => false }, ['system.screen.capture'])
+  await assert.rejects(() => background.call('system.captureScreen', {}), e => e.code === 'USER_CANCELLED')
+})
+test('clipboard image and file operations exchange real payloads with the host', async t => {
+  const png = 'data:image/png;base64,iVBORw0KGgo='
+  const writes = []
+  const env = await setup(t, { clipboardReadImage: async () => png, clipboardReadFiles: async () => ['D:\\a.txt', 'D:\\文件夹'],
+    clipboardWriteImage: async data => writes.push(data), clipboardWriteFiles: async paths => writes.push(paths) }, ['clipboard.current.read', 'clipboard.write'])
+  assert.equal(await env.call('clipboard.readImage', null), png)
+  assert.deepEqual(await env.call('clipboard.readFiles', null), ['D:\\a.txt', 'D:\\文件夹'])
+  assert.equal(await env.call('clipboard.writeImage', { dataUrl: png }), null)
+  assert.equal(await env.call('clipboard.writeFiles', { paths: ['D:\\a.txt', 'D:\\文件夹'] }), null)
+  assert.deepEqual(writes, [png, ['D:\\a.txt', 'D:\\文件夹']])
+  await assert.rejects(() => env.call('clipboard.writeFiles', { paths: ['https://example.com'] }), e => e.code === 'INVALID_REQUEST')
+})
+test('clipboard text read requires permission and a user gesture', async t => {
+  const env = await setup(t, { clipboardReadText: async () => '中文 clipboard' }, ['clipboard.current.read'])
+  assert.equal(await env.call('clipboard.readText', null), '中文 clipboard')
+  const denied = await setup(t, { clipboardReadText: () => 'secret' }, [])
+  await assert.rejects(() => denied.call('clipboard.readText', null), e => e.code === 'PERMISSION_DENIED')
+  const background = await setup(t, { clipboardReadText: () => 'secret', hasForegroundGesture: () => false }, ['clipboard.current.read'])
+  await assert.rejects(() => background.call('clipboard.readText', null), e => e.code === 'USER_CANCELLED')
+})
+test('desktop file selection and opening use the plugin capability and user gesture', async t => {
+  const opened = []
+  const env = await setup(t, { choosePaths: async kind => kind === 'file' ? ['D:\\example.txt'] : ['D:\\example'], openPath: async path => { opened.push(path); return '' } }, ['system.file.select', 'system.path.open'])
+  assert.deepEqual(await env.call('files.select', { kind: 'file', multiple: false }), ['D:\\example.txt'])
+  assert.deepEqual(await env.call('files.select', { kind: 'directory', multiple: false }), ['D:\\example'])
+  assert.equal(await env.call('files.openPath', { path: 'D:\\example.txt' }), null)
+  assert.deepEqual(opened, ['D:\\example.txt'])
+  await assert.rejects(() => env.call('files.openPath', { path: 'https://example.com' }), e => e.code === 'INVALID_REQUEST')
+  const denied = await setup(t, { choosePaths: async () => [] }, [])
+  await assert.rejects(() => denied.call('files.select', { kind: 'file', multiple: false }), e => e.code === 'PERMISSION_DENIED')
+  const cancelled = await setup(t, { choosePaths: async () => [] }, ['system.file.select'])
+  assert.deepEqual(await cancelled.call('files.select', { kind: 'file', multiple: false }), [])
+  const background = await setup(t, { choosePaths: async () => ['D:\\example.txt'], hasForegroundGesture: () => false }, ['system.file.select'])
+  await assert.rejects(() => background.call('files.select', { kind: 'file', multiple: false }), e => e.code === 'USER_CANCELLED')
+})
 async function setup(t, overrides = {}, capabilities = caps) {
   const root = await mkdtemp(join(tmpdir(), 'webtools-capability-')); t.after(() => rm(root, { recursive: true, force: true }))
   const base = runtimeV3Manifest(); const m = runtimeV3Manifest({ requestedCapabilities: capabilities,
@@ -51,10 +146,11 @@ test('context exposes only immutable invocation text and expires; revoked contex
   env.setNow(600000); await assert.rejects(() => env.call('context.current', null), e => e.code === 'CONTEXT_EXPIRED')
   env.authority.revoke(); await assert.rejects(() => env.call('context.current', null))
 })
-test('undelivered context expires at thirty seconds and revokes its Host-owned lifetime', async t => {
+test('undelivered context expires without revoking the running feature', async t => {
   const env = await setup(t); env.setNow(30000)
   await assert.rejects(() => env.call('context.current', null), e => e.code === 'CONTEXT_EXPIRED')
-  assert.equal(env.authority.isCurrent(), false)
+  assert.equal(env.authority.isCurrent(), true)
+  assert.equal(await env.call('clipboard.write', { text: 'still usable' }), null)
 })
 test('AI byte excess and raw provider failures are rejected without truncation or secret exposure', async t => {
   const oversized = await setup(t, { completeAI: async () => ({ text: 'x'.repeat(32769), outputTokens: 1 }) })
@@ -70,6 +166,17 @@ test('AI output rejects token overflow even with short text, and missing token u
   await assert.rejects(() => missing.call('ai.complete', { prompt: 'safe' }), e => e.code === 'NOT_AVAILABLE')
   const exact = await setup(t, { completeAI: async () => ({ text: 'short', outputTokens: 1024 }) })
   assert.deepEqual(await exact.call('ai.complete', { prompt: 'safe' }), { text: 'short' })
+})
+test('storage lists only matching keys in its own namespace and requires read permission', async t => {
+  const env = await setup(t)
+  await env.call('storage.set', { key: 'note-b', value: 'b' })
+  await env.call('storage.set', { key: 'note-a', value: 'a' })
+  await env.call('storage.set', { key: 'other', value: 'c' })
+  assert.deepEqual(await env.call('storage.list', { prefix: 'note-' }), ['note-a', 'note-b'])
+  assert.deepEqual(await env.call('storage.list', { prefix: 'missing' }), [])
+  await assert.rejects(() => env.call('storage.list', { prefix: '../' }))
+  const denied = await setup(t, {}, ['plugin.storage.write'])
+  await assert.rejects(() => denied.call('storage.list', { prefix: '' }), e => e.code === 'PERMISSION_DENIED')
 })
 test('storage uses Main namespace, read/write/delete and rolling quota; no caller identity/path survives schema', async t => {
   const env = await setup(t)

@@ -10,7 +10,7 @@ import {
   type NativeManagerAck,
   type NativeManagerEnvelope,
 } from './native-manager-protocol.ts'
-import type { AppSettings, SearchEngine, ThemePreference, LauncherDisplayMode, WebsiteSearchEntry } from '../../src/shared/domain'
+import type { AppSettings, SearchEngine, ThemePreference, LauncherDisplayMode, WebsiteSearchEntry, PluginFeatureShortcut } from '../../src/shared/domain'
 import { QUICK_RESULT_CAPABILITY, parseFeatureResultControl } from '../../src/shared/feature-quick-result-contracts.ts'
 
 export interface NativeAppSearchMemoryRecord { query: string; appId: string; lastUsedAt: number }
@@ -21,6 +21,7 @@ const supportedManagerCapabilities = [
   'launcher-feature-surfaces-v1',
   'super-panel-context-v1',
   'super-panel-settings-v2',
+  'plugin-mcp-gateway-v1',
 ] as const
 
 export interface NativeLauncherState {
@@ -35,11 +36,12 @@ export interface NativeLauncherState {
   everythingEsPath: string
   websites: WebsiteSearchEntry[]
   appSearchMemory: NativeAppSearchMemoryRecord[]
+  pluginFeatureShortcuts: PluginFeatureShortcut[]
 }
 
 export type NativeLauncherSettingsUpdate = Partial<Pick<AppSettings,
   'quickSearchShortcut' | 'theme' | 'launcherDisplayMode' | 'launchOnStartup' | 'searchEngines'
-  | 'defaultSearchEngineId' | 'everythingEnabled' | 'everythingEsPath'>>
+  | 'defaultSearchEngineId' | 'everythingEnabled' | 'everythingEsPath' | 'pluginFeatureShortcuts'>>
 
 export function parseNativeLauncherState(value: unknown): NativeLauncherState {
   if (!isRecord(value)
@@ -53,7 +55,8 @@ export function parseNativeLauncherState(value: unknown): NativeLauncherState {
     || typeof value.everythingEnabled !== 'boolean'
     || typeof value.everythingEsPath !== 'string'
     || !Array.isArray(value.websites)
-    || !Array.isArray(value.appSearchMemory)) {
+    || !Array.isArray(value.appSearchMemory)
+    || (value.pluginFeatureShortcuts !== undefined && !Array.isArray(value.pluginFeatureShortcuts))) {
     throw new NativeManagerRequestError('INVALID_NATIVE_STATE', 'Native Host returned an invalid Launcher state.')
   }
   const engines = value.searchEngines.every((engine) => isRecord(engine)
@@ -64,8 +67,11 @@ export function parseNativeLauncherState(value: unknown): NativeLauncherState {
     && typeof website.description === 'string' && Array.isArray(website.folderIds) && website.folderIds.every((id) => typeof id === 'string'))
   const memory = value.appSearchMemory.every((item) => isRecord(item)
     && typeof item.query === 'string' && typeof item.appId === 'string' && Number.isSafeInteger(item.lastUsedAt))
-  if (!engines || !websites || !memory) throw new NativeManagerRequestError('INVALID_NATIVE_STATE', 'Native Host returned an invalid Launcher state.')
-  return value as unknown as NativeLauncherState
+  const shortcuts = (value.pluginFeatureShortcuts ?? []).every((item) => isRecord(item)
+    && typeof item.pluginId === 'string' && typeof item.featureId === 'string' && typeof item.shortcut === 'string'
+    && (item.autoCopy === undefined || typeof item.autoCopy === 'boolean'))
+  if (!engines || !websites || !memory || !shortcuts) throw new NativeManagerRequestError('INVALID_NATIVE_STATE', 'Native Host returned an invalid Launcher state.')
+  return { ...value, pluginFeatureShortcuts: value.pluginFeatureShortcuts ?? [] } as unknown as NativeLauncherState
 }
 
 interface PendingRequest {
@@ -104,13 +110,14 @@ export class NativeManagerClient {
   private launcherFeaturesSupported = false
   private superPanelSupported = false
   private superPanelSettingsSupported = false
+  private mcpGatewaySupported = false
   private quickResultSupported = false
   private selectedTextMatchingSupported = false
   private closed = false
   private readonly pipeName: string
   private developmentAuthenticationToken: string | null
 
-  constructor(pipeName: string, developmentAuthenticationToken?: string, private readonly offerQuickResult = false, private readonly offerSelectedTextMatching = false) {
+  constructor(pipeName: string, developmentAuthenticationToken?: string, private readonly offerQuickResult = false, private readonly offerSelectedTextMatching = false, private readonly offerMcpGateway = false) {
     this.pipeName = pipeName
     this.developmentAuthenticationToken = developmentAuthenticationToken ?? null
   }
@@ -123,6 +130,7 @@ export class NativeManagerClient {
   get supportsSuperPanelSettings(): boolean { return this.isConnected && this.superPanelSettingsSupported }
   get supportsQuickResult(): boolean { return this.isConnected && this.quickResultSupported }
   get supportsSelectedTextMatching(): boolean { return this.isConnected && this.selectedTextMatchingSupported }
+  get supportsMcpGateway(): boolean { return this.isConnected && this.mcpGatewaySupported }
   async clearAcceptedQuickResultForSource(pluginId: string): Promise<void> {
     if (!this.supportsQuickResult) return
     // Idempotent capability reply exposes correlation metadata only. This does
@@ -167,6 +175,14 @@ export class NativeManagerClient {
       this.superPanelSupported = capabilities.includes(NativeManagerClient.superPanelCapability)
       this.superPanelSettingsSupported = capabilities.includes(NativeManagerClient.superPanelSettingsCapability)
       this.connected = true
+      // Optional extension after hello: old peers keep their strict capability whitelist.
+      this.mcpGatewaySupported = false
+      if (this.offerMcpGateway) try {
+        const extension = await this.request<{ capability?: string }>('mcp-gateway-negotiate-v1', { capability: 'plugin-mcp-gateway-v1' }, 3000)
+        this.mcpGatewaySupported = extension?.capability === 'plugin-mcp-gateway-v1'
+      } catch (error) {
+        if (!(error instanceof NativeManagerRequestError) || !['UNKNOWN_MESSAGE', 'CAPABILITY_REQUIRED'].includes(error.code)) throw error
+      }
       this.selectedTextMatchingSupported = false
       this.developmentAuthenticationToken = null
       // Legacy NativeHost validates the hello capability list strictly. An authenticated

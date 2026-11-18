@@ -74,14 +74,36 @@ export class ManagedFs {
       await this.assertSafe(path); return Buffer.concat(chunks)
     } finally { await file.close() }
   }
-  async atomicJson(logical: string, value: unknown, mayCommit: () => boolean = () => true): Promise<void> {
+  async listFiles(logical: string): Promise<Array<{ path: string; size: number }>> {
+    const root = await this.path(logical)
+    try {
+      const rootStat = await lstat(root)
+      if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) fail('UNSAFE_PATH')
+    } catch (error) { if (missing(error)) return []; throw error }
+    const files: Array<{ path: string; size: number }> = []
+    const visit = async (directory: string, prefix: string): Promise<void> => {
+      await this.assertSafe(directory)
+      for (const name of await readdir(directory)) {
+        const childPath = prefix ? `${prefix}/${name}` : name
+        const childLogical = `${logical}/${childPath}`
+        const child = await this.path(childLogical)
+        const stat = await lstat(child)
+        if (stat.isSymbolicLink()) fail('UNSAFE_PATH')
+        if (stat.isDirectory()) await visit(child, childPath)
+        else if (stat.isFile()) files.push({ path: childPath, size: stat.size })
+        else fail('UNSAFE_PATH')
+      }
+    }
+    await visit(root, '')
+    return files.sort((left, right) => left.path.localeCompare(right.path))
+  }
+  async atomicBytes(logical: string, bytes: Uint8Array, mayCommit: () => boolean = () => true): Promise<void> {
     const target = await this.path(logical); const temporary = join(dirname(target), `.write-${randomUUID()}.tmp`)
+    const content = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     await this.assertSafe(temporary)
     try {
       const file = await open(temporary, 'wx')
-      try { await file.writeFile(JSON.stringify(value)); await file.sync() } finally { await file.close() }
-      // Windows readers may briefly deny replacement. Keep the flushed file and
-      // original target intact, and revalidate authority before every attempt.
+      try { await file.writeFile(content); await file.sync() } finally { await file.close() }
       const retryDelays = [10, 20, 40, 80, 100]
       for (let attempt = 0; ; attempt++) {
         await this.assertSafe(temporary); await this.assertSafe(target)
@@ -95,6 +117,9 @@ export class ManagedFs {
       }
     }
     finally { await this.assertSafe(temporary); await rm(temporary, { force: true }) }
+  }
+  async atomicJson(logical: string, value: unknown, mayCommit: () => boolean = () => true): Promise<void> {
+    await this.atomicBytes(logical, Buffer.from(JSON.stringify(value)), mayCommit)
   }
   async remove(target: string): Promise<void> {
     const absolute = resolve(target)

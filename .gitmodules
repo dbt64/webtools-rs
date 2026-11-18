@@ -1,0 +1,3 @@
+[submodule "webtools-plugin"]
+	path = plugin-sdk
+	url = https://github.com/dbt64/webtools-plugin.git

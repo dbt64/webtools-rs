@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, sep } from 'node:path'
 import { PLUGIN_CAPABILITIES, type InstalledPluginCapability, type PluginAIReviewDTO, type PluginActionResult, type PluginInstallResult, type PluginInvokeRequest, type PluginPageDTO, type PluginSummary, type PluginVersionChange } from '../../src/shared/plugin-contracts.ts'
 import { LIMITS, boundedString, compareVersions, opaqueKey, record, validPluginId, versionParts } from './manifest.ts'
 import { ManagedFs, SerialQueue } from './managed-fs.ts'
-import { PluginRegistry, WEB_GRANTABLE_CAPABILITIES, type PluginRecord, type RegistryData, type InstalledVersion } from './plugin-registry.ts'
+import { PluginRegistry, WEB_GRANTABLE_CAPABILITIES, V3_CAPABILITIES, type PluginRecord, type RegistryData, type InstalledVersion } from './plugin-registry.ts'
 import { PluginStore } from './plugin-store.ts'
 import { validateIncomingPackage, validatePackage, validatePackageV3ForRuntime, type ValidatedPackage, type ValidatedRuntimePackageV3 } from './package-validator.ts'
 import type { ValidatedPluginPackageSnapshotV3 } from './validated-plugin-package-snapshot.ts'
@@ -255,10 +255,10 @@ export class PluginManager {
     }) }
   }
   async list(): Promise<PluginSummary[]> {
-    return this.data.plugins.map(p => ({ id: p.id, name: p.name, version: p.current.version, hash: p.current.hash, manifestVersion: p.manifestVersion ?? 1, ...(p.runtimeKind ? { runtimeKind: p.runtimeKind } : {}), enabled: p.enabled, status: this.intents.get(p.id)?.blocked ? 'stopping' : this.runtimes.get(p.id)?.invoking ? 'invoking' : p.status, requested: p.requested.slice(), granted: p.granted.slice(), installedVersions: [...new Set(p.versions.map(v => v.version))], source: 'local-unsigned', ...(p.manifestVersion === 3 ? { webFeatures: this.presentWebFeatures(p), unsupportedCapabilities: p.requested.filter(cap => !isWebCapabilityImplemented(cap as never, { manifestVersion: p.manifestVersion ?? 1, configuration: this.configuredWebPackages.has(p.id) ? true : undefined })) } : {}), ...(p.description !== undefined ? { description: p.description } : {}), ...(p.author ? { author: structuredClone(p.author) } : {}), ...(p.api ? { api: structuredClone(p.api) } : {}), ...(this.runtimes.get(p.id)?.iconDataUrl ? { iconDataUrl: this.runtimes.get(p.id)?.iconDataUrl } : {}), ...(p.errorCode ? { errorCode: p.errorCode } : {}) }))
+    return this.data.plugins.map(p => ({ id: p.id, name: p.name, version: p.current.version, hash: p.current.hash, manifestVersion: p.manifestVersion ?? 1, ...(p.runtimeKind ? { runtimeKind: p.runtimeKind } : {}), enabled: p.enabled, status: this.intents.get(p.id)?.blocked ? 'stopping' : this.runtimes.get(p.id)?.invoking ? 'invoking' : p.status, requested: p.requested.slice(), granted: p.granted.slice(), installedVersions: [...new Set(p.versions.map(v => v.version))], source: 'local-unsigned', ...(p.manifestVersion === 3 ? { mcpToolCount: (this.webFeatureMetadata.get(p.id) ?? []).filter(feature => feature.mcpTool).length, webFeatures: this.presentWebFeatures(p), unsupportedCapabilities: p.requested.filter(cap => !isWebCapabilityImplemented(cap as never, { manifestVersion: p.manifestVersion ?? 1, configuration: this.configuredWebPackages.has(p.id) ? true : undefined })) } : {}), ...(p.description !== undefined ? { description: p.description } : {}), ...(p.author ? { author: structuredClone(p.author) } : {}), ...(p.api ? { api: structuredClone(p.api) } : {}), ...(this.runtimes.get(p.id)?.iconDataUrl ? { iconDataUrl: this.runtimes.get(p.id)?.iconDataUrl } : {}), ...(p.errorCode ? { errorCode: p.errorCode } : {}) }))
   }
   private presentWebFeatures(p: PluginRecord): NonNullable<PluginSummary['webFeatures']> {
-    return (this.webFeatureMetadata.get(p.id) ?? []).map(feature => ({ id: feature.id, title: feature.title,
+    return (this.webFeatureMetadata.get(p.id) ?? []).filter(feature => !feature.mcpTool).map(feature => ({ id: feature.id, title: feature.title,
       ...(feature.description ? { description: feature.description } : {}),
       // Current production entry paths all reach live Main revalidation. These are
       // Host-supported surfaces, not new Manifest declarations or execution grants.
@@ -281,7 +281,7 @@ export class PluginManager {
         try { pkg = await this.loadRuntimeV3(plugin) } catch { continue }
         if (this.closed || !plugin.enabled || this.intents.get(plugin.id)?.blocked) continue
         for (const feature of pkg.manifest.features) {
-          if (!supportsFeaturePresentation(pkg.manifest, feature) || !feature.requiredCapabilities.every(cap =>
+          if (feature.mcpTool || !supportsFeaturePresentation(pkg.manifest, feature) || !feature.requiredCapabilities.every(cap =>
             isWebCapabilityImplemented(cap as never, pkg.manifest) && plugin.requested.includes(cap as InstalledPluginCapability)
               && plugin.granted.includes(cap as InstalledPluginCapability))) continue
           let iconDataUrl: string | undefined
@@ -296,6 +296,20 @@ export class PluginManager {
         }
       }
       return candidates
+    })
+  }
+  listMcpTools() {
+    return this.data.plugins.flatMap(plugin => {
+      if (this.closed || !plugin.enabled || this.intents.get(plugin.id)?.blocked
+        || ['invalid', 'incompatible', 'faulted', 'stopping'].includes(plugin.status)) return []
+      return (this.webFeatureMetadata.get(plugin.id) ?? []).flatMap(feature => {
+        if (!feature.mcpTool || !feature.requiredCapabilities.every(capability => plugin.granted.includes(capability)
+          && plugin.requested.includes(capability) && isWebCapabilityImplemented(capability as import('./web-feature-authority.ts').WebCapability, {
+            manifestVersion: 3, configuration: this.configuredWebPackages.has(plugin.id) ? true : undefined,
+          }))) return []
+        return [{ pluginId: plugin.id, featureId: feature.id, title: feature.title,
+          description: feature.description || feature.title, ...feature.mcpTool }]
+      })
     })
   }
   /** Returns only safe Main-owned metadata for currently eligible v1 page Features. */
@@ -365,7 +379,7 @@ export class PluginManager {
   private async summary(id: string): Promise<PluginSummary> { return (await this.list()).find(p => p.id === id)! }
   /** Installs produce no runtime privilege. Only this live Main-side resolution can issue a ticket. */
   async authorizeWebFeature(ref: FeatureRef, session: string | null,
-    dispatch: (authority: WebFeatureAuthority, isSourceCurrent: () => boolean) => Promise<void>): Promise<{ completion: Promise<void> }> {
+    dispatch: (authority: WebFeatureAuthority, isSourceCurrent: () => boolean) => Promise<void>, source: 'desktop' | 'mcp' = 'desktop'): Promise<{ completion: Promise<void> }> {
     tracePluginRuntimeAcceptance('plugin-authorize-queued', { pluginId: ref.pluginId, featureId: ref.featureId })
     if (!isFeatureRef(ref) || typeof dispatch !== 'function') fail('INVALID_INPUT')
     const assertActivation = () => {
@@ -381,14 +395,14 @@ export class PluginManager {
       tracePluginRuntimeAcceptance('plugin-authorize-loaded', { pluginId: ref.pluginId, featureId: ref.featureId })
       assertActivation()
       const feature = snapshot.manifest.features.find(f => f.id === ref.featureId)
-      if (!feature) fail('ACTION_NOT_DECLARED')
-      const current = (capability?: import('../../plugin-sdk/declarative-v1/runtime/manifest-v2.mjs').CapabilityV2): boolean => {
+      if (!feature || Boolean(feature.mcpTool) !== (source === 'mcp')) fail('ACTION_NOT_DECLARED')
+      const current = (capability?: import('./web-feature-authority.ts').WebCapability): boolean => {
         const row = this.data.plugins.find(item => item.id === p.id)
         return !this.closed && row === p && row.manifestVersion === 3 && row.enabled
           && !this.intents.get(row.id)?.blocked && !['invalid', 'incompatible', 'faulted'].includes(row.status)
           && row.current.hash === snapshot.packageHash && row.current.version === snapshot.manifest.version
           && feature.requiredCapabilities.every(cap => isWebCapabilityImplemented(cap as import('../../plugin-sdk/declarative-v1/runtime/manifest-v2.mjs').CapabilityV2, snapshot.manifest) && row.requested.includes(cap as InstalledPluginCapability) && row.granted.includes(cap as InstalledPluginCapability))
-          && (!capability || isWebCapabilityImplemented(capability, snapshot.manifest) && (feature.requiredCapabilities as readonly import('../../plugin-sdk/declarative-v1/runtime/manifest-v2.mjs').CapabilityV2[]).includes(capability)
+          && (!capability || isWebCapabilityImplemented(capability, snapshot.manifest) && (feature.requiredCapabilities as readonly string[]).includes(capability)
             && row.requested.includes(capability) && row.granted.includes(capability))
       }
       if (!current()) fail('PERMISSION_DENIED')
@@ -543,7 +557,7 @@ export class PluginManager {
     this.assertSession(session)
     const previous = this.find(id)
     if ((previous.manifestVersion === 2 || previous.manifestVersion === 3) && Array.isArray(grants) && grants.includes('network.domains')) fail('INCOMPATIBLE_PLUGIN')
-    const allowed: readonly string[] = previous.manifestVersion === 2 || previous.manifestVersion === 3 ? WEB_GRANTABLE_CAPABILITIES : PLUGIN_CAPABILITIES
+    const allowed: readonly string[] = previous.manifestVersion === 3 ? V3_CAPABILITIES : previous.manifestVersion === 2 ? WEB_GRANTABLE_CAPABILITIES : PLUGIN_CAPABILITIES
     if (!Array.isArray(grants) || grants.length > allowed.length || grants.some(cap => !allowed.includes(cap)) || new Set(grants).size !== grants.length) fail('INVALID_INPUT')
     if (grants.some(cap => !previous.requested.includes(cap))) fail('INVALID_INPUT')
     const intent = this.beginIntent(id, previous.manifestVersion === 2 || previous.manifestVersion === 3 || previous.granted.some(cap => !grants.includes(cap)))

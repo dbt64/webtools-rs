@@ -9,7 +9,7 @@ function applyState(state: PluginWindowChromeState): void {
   let style = document.querySelector<HTMLStyleElement>('#plugin-window-theme')
   if (!style) { style = document.createElement('style'); style.id = 'plugin-window-theme'; document.head.append(style) }
   style.textContent = state.themeCss
-  menu.querySelector<HTMLElement>('[data-action="detach"]')!.hidden = state.mode === 'detached'
+  menu.querySelector<HTMLElement>('[data-action="toggle-detach"]')!.setAttribute('aria-checked', String(state.mode === 'detached'))
   menu.querySelector<HTMLElement>('.detached-only')!.hidden = state.mode !== 'detached'
 }
 

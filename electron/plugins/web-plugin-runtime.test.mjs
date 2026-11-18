@@ -13,6 +13,8 @@ import { isWebFeatureAuthority } from './web-feature-authority.ts'
 import { WebHostCapabilities } from './web-host-capabilities.ts'
 import { buildRuntimeCsp, buildRuntimeResourceUrl, createRuntimeOrigin, parseRuntimePackageUrl, selectValidatedWebFeature } from './web-runtime-policy.ts'
 import { resolvePluginWindowTheme } from './plugin-window-theme.ts'
+import { createBridgeConnection } from '../../plugin-sdk/declarative-v1/web/bridge-client.mjs'
+import { encodeMessage } from '../../plugin-sdk/declarative-v1/web/protocol.mjs'
 
 const source = stripTypeScriptTypes(
   (await readFile(new URL('./web-plugin-runtime.ts', import.meta.url), 'utf8'))
@@ -117,19 +119,23 @@ function harness(preloadHello = true, autoFinish = true, runtimeOptions = undefi
   }
   const children = []
   const window = {
+    visible: false, isVisible() { return this.visible }, isMinimized: () => false,
     isDestroyed: () => false, isFocused: () => true, webContents: { isDestroyed: () => false },
     contentView: { children, addChildView: view => children.push(view), removeChildView: view => children.splice(children.indexOf(view), 1) },
   }
   const Runtime = runInNewContext(`${source}\nWebPluginRuntime`, {
     WebContentsView: View, pluginRuntimeSession,
     dialog: { async showMessageBox() { return { response: 0 } }, async showSaveDialog() { return { canceled: true } } },
-    ipcMain, WebPluginBridge, PLUGIN_BRIDGE_CLIENT_ROUTE, PLUGIN_BRIDGE_HOST_ROUTE, join, __dirname: '.',
+    ipcMain, WebPluginBridge: class extends WebPluginBridge {
+      // The VM is a test isolation boundary. Production Runtime and Bridge share a realm.
+      publishEvent(event, payload) { super.publishEvent(event, structuredClone(payload)) }
+    }, PLUGIN_BRIDGE_CLIENT_ROUTE, PLUGIN_BRIDGE_HOST_ROUTE, join, __dirname: '.',
     PLUGIN_RUNTIME_PRELOAD_ERROR_ROUTE, isAbsolute, Buffer, tracePluginRuntimeAcceptance: () => undefined,
     buildRuntimeCsp, buildRuntimeResourceUrl, createRuntimeOrigin, parseRuntimePackageUrl, selectValidatedWebFeature,
     isValidatedPluginRuntimeSnapshot, isWebFeatureAuthority, WebHostCapabilities, nextRuntimeGeneration: (() => { let generation = 0; return () => ++generation })(),
     Date, performance, setTimeout, clearTimeout, process: { argv: [], env: {} }, Headers, Response,
   })
-  return { runtime: new Runtime(() => window, runtimeOptions, capabilityDependencies, resolveNodePreload, undefined, theme?.source, handleEscape), currentSession, views, ipcMain, partitions, get clearStorageCalls() { return clearStorageCalls } }
+  return { runtime: new Runtime(() => window, runtimeOptions, capabilityDependencies, resolveNodePreload, undefined, theme?.source, handleEscape), currentSession, views, ipcMain, partitions, window, get clearStorageCalls() { return clearStorageCalls } }
 }
 
 test('runtime view can be hidden behind the Host loading shell and restored without replacing it', async () => {
@@ -170,6 +176,54 @@ async function waitUntil(predicate) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setImmediate(resolve)) }
   assert.fail('runtime did not reach expected state')
 }
+
+test('hidden scheduled runtime delivers stable code through real SDK, awaits async callback and propagates failure without launcher lifecycle entry', async t => {
+  const { PluginManager } = await import('./plugin-manager.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises'); const { tmpdir } = await import('node:os')
+  const root = await mkdtemp(join(tmpdir(), 'webtools-scheduled-runtime-')); t.after(() => rm(root, { recursive: true, force: true }))
+  const manager = new PluginManager({ userData: root, hostVersion: '0.1.0', confirm: async () => true, externalOpen: async () => {}, clipboardWrite() {},
+    ai: { complete: async () => ({ text: '' }), getDefaultProviderInfo: async () => ({ providerName: 'test', model: 'test' }) } })
+  await manager.initialize(); t.after(() => manager.close())
+  const base = runtimeV3Manifest(); const grants = ['plugin.tasks', 'plugin.storage.write']
+  const manifest = runtimeV3Manifest({ requestedCapabilities: grants, features: [{ ...base.features[0], requiredCapabilities: grants }] })
+  await manager.install(runtimeV3Package(manifest), manager.session); await manager.setEnabled(manifest.id, true, manager.session)
+  const h = harness(true, true, undefined, () => ({ store: manager.store, effects: {} })); t.after(() => h.runtime.close())
+  const ticket = await manager.authorizeWebFeature({ pluginId: manifest.id, featureId: 'hello' }, null, a => h.runtime.openAuthority(a).then(() => {})); await ticket.completion
+  const contents = h.views[0].webContents; const events = new Map(); const replies = new Map(); let sequence = 0
+  const originalSend = contents.send.bind(contents)
+  contents.send = (route, raw) => {
+    originalSend(route, raw); const message = JSON.parse(raw)
+    if (message.type === 'response') { replies.get(message.requestId)?.(message); replies.delete(message.requestId) }
+    if (message.type === 'event') events.get(message.event)?.(message.payload)
+  }
+  const connection = createBridgeConnection({ getReady: async () => ({ accepted: true }), onClose: () => () => {},
+    onEvent: (name, fn) => { events.set(name, fn); return () => events.delete(name) },
+    submit: (method, payload) => {
+      const requestId = String(++sequence)
+      const response = new Promise(resolve => replies.set(requestId, resolve))
+      h.ipcMain.emit(PLUGIN_BRIDGE_CLIENT_ROUTE, { sender: contents, senderFrame: contents.mainFrame }, encodeMessage({ type: 'request', protocolMajor: 1, requestId, method, payload }, 'client'))
+      return { response, cancel() {} }
+    } }); t.after(() => connection.dispose())
+  const api = connection.publicClient; await api.ready
+  const gate = deferred(); let received; let finished = false
+  const off = api.tasks.onTrigger(async event => { received = event; await gate.promise; await api.storage.set('task-result', event.code) })
+  const executing = h.runtime.runScheduledTask({ code: 'stable-code', executionId: 'run-1', scheduledAtMs: 1234 }).then(() => { finished = true })
+  await waitUntil(() => received)
+  assert.equal(received.code, 'stable-code'); assert.equal(finished, false); assert.equal(h.window.visible, false)
+  assert.equal(contents.sent.some(item => item.message.event === 'lifecycle.changed'), false)
+  gate.resolve(); await executing
+  assert.equal(await manager.store.readData(manifest.id, 'task-result'), 'stable-code')
+  off(); const offFailure = api.tasks.onTrigger(async () => { await Promise.resolve(); throw new Error('intentional async failure') })
+  await assert.rejects(h.runtime.runScheduledTask({ code: 'failed-code', executionId: 'run-2', scheduledAtMs: 2345 }), /intentional async failure/)
+  offFailure(); const callbackEntered = deferred()
+  api.tasks.onTrigger(async () => { callbackEntered.resolve(); await new Promise(() => {}) })
+  const cancelled = h.runtime.runScheduledTask({ code: 'revoked', executionId: 'run-3', scheduledAtMs: 3456 })
+  const cancellation = assert.rejects(cancelled, /cancelled/)
+  await callbackEntered.promise
+  await manager.setEnabled(manifest.id, false, manager.session); await cancellation
+  await h.runtime.waitForTeardown(); assert.equal(contents.destroyed, true)
+  await assert.rejects(h.runtime.runScheduledTask({ code: 'revoked', executionId: 'run-4', scheduledAtMs: 4567 }), /unavailable/)
+})
 
 test('theme is installed before READY and live replacement keeps one current root stylesheet', async () => {
   const first = deferred(); const source = themeSource(); let inserts = 0
@@ -577,4 +631,36 @@ test('a controlled runtime ping is canceled by the current Bridge exactly once a
     await flush()
     assert.deepEqual(contents.sent.at(-1).message, { type: 'response', protocolMajor: 1, requestId: '2', ok: true, result: null })
   } finally { await h.runtime.close() }
+})
+
+
+test('lifecycle is opt-in, replays current state, and distinguishes recall from a new entry', async () => {
+  const h = harness()
+  await h.runtime.open(await runtimeSnapshot(), 'hello')
+  const contents = h.views[0].webContents
+  const events = () => contents.sent.map(entry => entry.message).filter(message => message.event === 'lifecycle.changed')
+  h.runtime.notifyEnter()
+  h.window.visible = true; h.runtime.notifyVisibility(true)
+  assert.equal(events().length, 0, 'old SDK clients receive no new event envelopes')
+  h.ipcMain.emit(PLUGIN_BRIDGE_CLIENT_ROUTE, { sender: contents, senderFrame: contents.mainFrame },
+    '{"type":"request","protocolMajor":1,"requestId":"1","method":"lifecycle.subscribe","payload":null}')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(events().map(message => message.payload.phase), ['enter', 'show'], JSON.stringify(contents.sent))
+  assert.equal(events()[0].payload.entryCount, 1)
+  h.runtime.notifyVisibility(false); h.runtime.notifyVisibility(false)
+  h.runtime.notifyVisibility(true)
+  assert.deepEqual(events().slice(-2).map(message => message.payload.phase), ['hide', 'show'])
+  assert.equal(events().at(-1).payload.entryCount, 1, 'hotkey recall is not a new invocation')
+  h.runtime.notifyEnter()
+  assert.equal(events().at(-1).payload.entryCount, 2)
+  const generation = events().at(-1).payload.generation
+  const eventCount = events().length
+  await h.runtime.close()
+  h.runtime.notifyEnter(); h.runtime.notifyVisibility(true)
+  assert.equal(events().length, eventCount)
+  await h.runtime.open(await runtimeSnapshot(), 'hello')
+  h.runtime.notifyEnter()
+  assert.equal(h.views[1].webContents.sent.some(entry => entry.message.event === 'lifecycle.changed'), false)
+  assert.notEqual(h.runtime.status.generation, generation)
+  await h.runtime.close()
 })

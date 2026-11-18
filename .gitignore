@@ -7,7 +7,5 @@ webtools-launcher.json
 /dist/
 /release/
 **/bin/
-!plugin-sdk/create-webtools-plugin/bin/
-!plugin-sdk/create-webtools-plugin/bin/**
 **/obj/
 *.log

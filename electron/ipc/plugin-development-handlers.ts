@@ -16,7 +16,11 @@ export function registerPluginDevelopmentHandlers(ipc: ManagerInvokeRegistry, de
       const data = await action(args)
       if (!deps.isManagerMainFrame(event)) throw new Error('Manager session changed.')
       return { ok: true, data }
-    } catch {
+    } catch (error) {
+      const code = (error as { code?: string })?.code
+      if (code === 'DEV_CONTEXT_UNSUPPORTED' || code === 'DEV_INVALID_CONTEXT') return { ok: false, error: {
+        code, message: code === 'DEV_CONTEXT_UNSUPPORTED' ? '此功能未声明接受当前模拟内容，请切换模拟类型或修改 Feature 的 acceptedContexts。' : '模拟入口或内容格式无效，请检查文字长度、文件路径和项目数量。',
+      } }
       return { ok: false, error: { code: 'DEVELOPMENT_OPERATION_FAILED', message: '开发操作未完成。请先在所选项目运行 pnpm dev，查看开发者诊断后重新连接。' } }
     }
   }
@@ -33,9 +37,10 @@ export function registerPluginDevelopmentHandlers(ipc: ManagerInvokeRegistry, de
       return deps.development.status
     }),
     [IPC_CHANNELS.pluginDevelopmentDisconnect]: guard(0, async () => { await deps.development.disconnect(); return deps.development.status }),
-    [IPC_CHANNELS.pluginDevelopmentOpen]: guard(1, async args => {
+    [IPC_CHANNELS.pluginDevelopmentReconnect]: guard(0, async () => { await deps.development.reconnect(); return deps.development.status }),
+    [IPC_CHANNELS.pluginDevelopmentOpen]: guard(2, async args => {
       if (typeof args[0] !== 'string' || args[0].length > 128) throw new Error('Invalid Feature identity.')
-      await deps.development.openFeature(args[0])
+      await deps.development.openFeature(args[0], args[1])
     }),
     [IPC_CHANNELS.pluginDevelopmentCopy]: guard(2, async args => {
       if (!deps.development.status.enabled || typeof args[0] !== 'string') throw new Error('Developer diagnostics unavailable.')

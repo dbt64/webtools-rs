@@ -8,7 +8,12 @@
   </head>
   <body>
     <nav id="plugin-window-menu" aria-label="插件窗口操作">
-      <button data-action="detach">分离为独立窗口 <kbd>Ctrl+D</kbd></button>
+      <button data-action="toggle-detach" role="menuitemcheckbox" aria-checked="false">
+        <span class="menu-check" aria-hidden="true"></span>
+        <span class="menu-label">分离为独立窗口</span>
+        <kbd>Ctrl+D</kbd>
+      </button>
+      <hr />
       <button data-action="about">关于插件应用</button>
       <button data-action="settings">插件应用设置</button>
       <hr />

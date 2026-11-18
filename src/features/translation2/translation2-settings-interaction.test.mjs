@@ -12,6 +12,35 @@ const { default: View } = await server.ssrLoadModule('/src/features/translation2
 View.render = () => null
 const renderer = createRenderer({ createComment: () => ({}), insert() {}, remove() {}, parentNode: () => null, nextSibling: () => null })
 
+test('switching website tabs reuses completed translation but changed text triggers a new request', async t => {
+  const previousWindow = globalThis.window, previousObserver = globalThis.ResizeObserver
+  let settings = createDefaultTranslation2WorkspaceSettings(); let calls = 0; let websiteText
+  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} }
+  globalThis.window = { setTimeout, clearTimeout, translation2: {
+    onOpened: () => () => {}, cancel: async () => ({ ok: true }),
+    translate: async () => { calls++; return { ok: true, data: { translation: `结果${calls}` } } },
+    selectTab: async ({ tab, sourceText }) => { settings = { ...settings, activeTab: tab }; return { ok: true, data: { settings, sourceText: tab.kind === 'webtools' ? websiteText ?? sourceText : sourceText, sourceSynchronized: true } } },
+    setWebsiteBounds: async () => ({}),
+  } }
+  const app = renderer.createApp(View, { initialBootstrap: { open: { generation: 1, sourceText: 'Hello' }, settings, websites: TRANSLATION2_WEBSITE_PROVIDERS, aiProviders: [], machineConfigured: {}, languageDefaults: { sourceLanguage: 'auto', targetLanguage: 'zh-CN' } } })
+  app.provide(Symbol.for('v-scx'), { modules: new Set() })
+  const vm = app.mount({}), view = vm.$.setupState
+  t.after(() => { app.unmount(); globalThis.window = previousWindow; globalThis.ResizeObserver = previousObserver })
+  await new Promise(resolve => setTimeout(resolve, 650))
+  assert.equal(calls, 1); assert.equal(view.state.result, '结果1')
+  await view.selectTab({ kind: 'website', providerId: 'google' })
+  await view.selectTab({ kind: 'webtools' })
+  await new Promise(resolve => setTimeout(resolve, 650))
+  assert.equal(calls, 1); assert.equal(view.state.result, '结果1')
+  await view.selectTab({ kind: 'website', providerId: 'google' }); websiteText = 'Changed on website'
+  await view.selectTab({ kind: 'webtools' })
+  await new Promise(resolve => setTimeout(resolve, 650))
+  assert.equal(calls, 2); assert.equal(view.state.result, '结果2')
+  view.state.sourceText = 'Hello again'; view.sourceChanged()
+  await new Promise(resolve => setTimeout(resolve, 650))
+  assert.equal(calls, 3); assert.equal(view.state.result, '结果3')
+})
+
 test('mounted settings can hide, show, reorder websites and select AI with cloneable IPC payloads', async t => {
   const previousWindow = globalThis.window, previousObserver = globalThis.ResizeObserver
   let persisted = createDefaultTranslation2WorkspaceSettings()

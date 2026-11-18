@@ -14,6 +14,8 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
+use crate::mcp_dispatch::McpDispatch;
+type McpHandlerSlot = Arc<Mutex<Option<webtools_ipc::session::McpHandler>>>;
 
 /// What the supervisor reports back to the UI thread.
 pub enum HostEvent {
@@ -59,6 +61,12 @@ pub enum HostEvent {
 
 #[derive(Clone)]
 pub enum HostCommand {
+    McpWake,
+    ScheduledTask {
+        task: webtools_ipc::scheduled_tasks::ScheduledTask,
+        store: Arc<Mutex<webtools_ipc::scheduled_tasks::ScheduledTasks>>,
+        owner: String,
+    },
     OpenPage {
         section: &'static str,
         request_id: String,
@@ -166,6 +174,10 @@ impl HostCommand {
             end_session_after: None,
         }
     }
+    pub fn invoke_hotkey(plugin: String, feature: String, selection: Option<webtools_ipc::projection::Selection>) -> Self {
+        Self::Invoke { request_id: String::new(), source: "hotkey", plugin, feature, selection,
+            launcher_text: None, quick_result: false, end_session_after: None }
+    }
     pub fn translation(text: String, source: &'static str) -> Self {
         Self::Translation {
             request_id: String::new(),
@@ -197,6 +209,8 @@ impl HostCommand {
                 *release = end_session_after;
             }
             Self::SyncOwnership
+            | Self::McpWake
+            | Self::ScheduledTask { .. }
             | Self::Shutdown
             | Self::CancelResult { .. }
             | Self::AIConsentDecision { .. }
@@ -589,6 +603,8 @@ mod tests {
 }
 
 pub struct HostRuntime {
+    mcp_dispatch: Arc<Mutex<McpDispatch>>,
+    mcp_handler: McpHandlerSlot,
     tx: Sender<HostCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
     cancelled: Arc<AtomicBool>,
@@ -613,10 +629,39 @@ impl HostRuntime {
         let connected = Arc::new(AtomicBool::new(false));
         let connection_generation = Arc::new(AtomicU64::new(0));
         let process = Arc::new(Mutex::new(None));
+        let test_cooldown=std::env::var("WT_MCP_ACCEPTANCE_COOLDOWN_MS").ok();
+        let cooldown=crate::mcp_dispatch::acceptance_cooldown(std::env::var_os("WT_PROFILE_ROOT").is_some(),std::env::var("WT_MCP_GATEWAY_ACCEPTANCE").as_deref()==Ok("1"),test_cooldown.as_deref());
+        let mcp_dispatch=Arc::new(Mutex::new(McpDispatch::new(ownership.clone(),cooldown)));
+        let mcp_handler:McpHandlerSlot=Arc::new(Mutex::new(None));
+        let dispatch_thread=mcp_dispatch.clone(); let handler_thread=mcp_handler.clone();
         let stop = cancelled.clone();
         let connected_thread = connected.clone();
         let connection_generation_thread = connection_generation.clone();
         let process_thread = process.clone();
+        let schedule_path = crate::config::profile_root().join("plugin-scheduled-tasks.json");
+        let schedules = match webtools_ipc::scheduled_tasks::ScheduledTasks::load(&schedule_path, webtools_ipc::scheduled_tasks::now_ms()) {
+            Ok(store) => Some(Arc::new(Mutex::new(store))),
+            Err(error) => { eprintln!("host: scheduled tasks unavailable: {error}"); None }
+        };
+        if let Some(store) = schedules.clone() {
+            let schedule_tx = tx.clone(); let schedule_stop = stop.clone(); let schedule_ownership = ownership.clone();
+            std::thread::spawn(move || {
+                while !schedule_stop.load(Ordering::SeqCst) {
+                    let due = store.lock().unwrap().take_due(webtools_ipc::scheduled_tasks::now_ms());
+                    match due {
+                        Ok(tasks) => for task in tasks {
+                            let owner = format!("scheduled-task-{}", webtools_ipc::new_request_id());
+                            schedule_ownership.begin_session(&owner);
+                            if schedule_tx.send(HostCommand::ScheduledTask { task, store: store.clone(), owner: owner.clone() }).is_err() {
+                                schedule_ownership.end_session(&owner); return;
+                            }
+                        },
+                        Err(error) => eprintln!("host: schedule tick failed: {error}"),
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        }
         let thread = std::thread::spawn(move || {
             supervise(
                 exe,
@@ -631,10 +676,15 @@ impl HostRuntime {
                 ownership,
                 launcher_state,
                 projection_cache,
+                schedules,
+                dispatch_thread,
+                handler_thread,
             );
             connected_thread.store(false, Ordering::SeqCst);
         });
         Self {
+            mcp_dispatch,
+            mcp_handler,
             tx,
             thread: Some(thread),
             cancelled,
@@ -647,6 +697,8 @@ impl HostRuntime {
     pub fn handle(&self) -> Sender<HostCommand> {
         self.tx.clone()
     }
+    pub fn mcp_dispatch(&self)->Arc<Mutex<McpDispatch>> { self.mcp_dispatch.clone() }
+    pub fn set_mcp_handler(&self,handler:webtools_ipc::session::McpHandler) { *self.mcp_handler.lock().unwrap()=Some(handler); }
 
     pub fn is_finished(&self) -> bool {
         self.thread
@@ -727,13 +779,21 @@ fn supervise(
     ownership: webtools_ipc::HostOwnership,
     launcher_state: Arc<Mutex<webtools_ipc::state::LauncherStateStore>>,
     projection_cache: webtools_ipc::projection_cache::ProjectionCache,
+    schedules: Option<Arc<Mutex<webtools_ipc::scheduled_tasks::ScheduledTasks>>>,
+    mcp_dispatch: Arc<Mutex<McpDispatch>>,
+    mcp_handler: McpHandlerSlot,
 ) {
     let mut attempt: u32 = 0;
     let mut pending: Option<HostCommand> = None;
     loop {
+        mcp_dispatch.lock().unwrap().tick(Instant::now());
         if cancelled.load(Ordering::SeqCst) {
             return;
         }
+        if pending.is_none() && ownership.has_owners() {
+            if let Ok(command) = rx.try_recv() { pending = Some(command); }
+        }
+        if matches!(pending.as_ref(), Some(HostCommand::Shutdown)) { return; }
         if !ownership.has_owners() {
             match pending
                 .take()
@@ -755,7 +815,13 @@ fn supervise(
             let retry = attempt - 1;
             let _ = events.send(HostEvent::Reconnecting { attempt: retry });
             eprintln!("host: reconnecting attempt {retry}");
-            std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+            let retry_deadline=Instant::now()+Duration::from_millis(400 * attempt as u64);
+            while Instant::now()<retry_deadline && !cancelled.load(Ordering::SeqCst) {
+                mcp_dispatch.lock().unwrap().tick(Instant::now());
+                if !ownership.has_owners() { break; }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !ownership.has_owners() { attempt=0; continue; }
         }
         let Some(mut link) = open_link(
             &exe,
@@ -766,6 +832,9 @@ fn supervise(
             &events,
             ownership.clone(),
             launcher_state.clone(),
+            schedules.clone(),
+            mcp_dispatch.clone(),
+            mcp_handler.clone(),
         ) else {
             connected.store(false, Ordering::SeqCst);
             if !ownership.has_owners() {
@@ -774,8 +843,21 @@ fn supervise(
             }
             attempt += 1;
             if attempt >= MAX_ATTEMPTS {
+                if mcp_dispatch.lock().unwrap().has_work() {
+                    mcp_dispatch.lock().unwrap().disconnect();
+                    if matches!(pending.as_ref(),Some(HostCommand::McpWake)) { pending=None; }
+                    attempt=0; continue;
+                }
                 eprintln!("host: manager never started after {MAX_ATTEMPTS} attempts");
                 let _ = events.send(HostEvent::Disconnected("manager did not start".into()));
+                if matches!(pending.as_ref(), Some(HostCommand::ScheduledTask { .. })) {
+                    if let Some(HostCommand::ScheduledTask { task, store, owner }) = pending.take() {
+                        let _ = store.lock().unwrap().record_result(&task.plugin_id, &task.code, Some("Electron Host did not start after bounded retries".into()));
+                        ownership.end_session(&owner);
+                    }
+                    attempt = 0;
+                    continue;
+                }
                 return;
             }
             continue;
@@ -818,6 +900,7 @@ fn supervise(
             connected.store(false, Ordering::SeqCst);
             link.host.kill();
             process.lock().unwrap().take();
+            mcp_dispatch.lock().unwrap().disconnect();
             if !ownership.has_owners() {
                 attempt = 0;
                 continue;
@@ -913,6 +996,9 @@ fn supervise(
         }
         link.host.kill();
         process.lock().unwrap().take();
+        if manager_requested_exit {
+            mcp_dispatch.lock().unwrap().idle_exit(&link.session.take_undelivered_mcp_calls());
+        } else { mcp_dispatch.lock().unwrap().disconnect(); }
         if manager_requested_exit || !ownership.has_owners() {
             attempt = 0;
             if matches!(pending.as_ref(), Some(HostCommand::SyncOwnership)) {
@@ -966,6 +1052,9 @@ fn open_link(
     events: &Sender<HostEvent>,
     ownership: webtools_ipc::HostOwnership,
     launcher_state: Arc<Mutex<webtools_ipc::state::LauncherStateStore>>,
+    schedules: Option<Arc<Mutex<webtools_ipc::scheduled_tasks::ScheduledTasks>>>,
+    mcp_dispatch: Arc<Mutex<McpDispatch>>,
+    mcp_handler: McpHandlerSlot,
 ) -> Option<Link> {
     let started = Instant::now();
     let nanos = std::time::SystemTime::now()
@@ -1005,7 +1094,10 @@ fn open_link(
         *process.lock().unwrap() = Some(unsafe { OwnedHandle::from_raw_handle(handle as _) });
     }
     let spawned = started.elapsed();
-    let Ok(connection) = server.accept_until(cancelled, Duration::from_secs(20)) else {
+    let Ok(connection) = server.accept_until_with_tick(cancelled, Duration::from_secs(20), || {
+        mcp_dispatch.lock().unwrap().tick(Instant::now());
+        ownership.has_owners()
+    }) else {
         host.kill();
         return None;
     };
@@ -1016,6 +1108,11 @@ fn open_link(
     }
     let mut session =
         webtools_ipc::HostSession::with_shared_state(connection, launcher_state, ownership);
+    session.set_mcp_handler(Box::new(move|kind,payload| {
+        match mcp_handler.lock().unwrap().as_mut() { Some(handler)=>handler(kind,payload),None=>Err("MCP gateway unavailable".into()) }
+    }));
+    session.set_mcp_pump(Box::new(move|session|drive_mcp(session,&mcp_dispatch)));
+    if let Some(schedules) = schedules { session.set_scheduled_tasks(schedules); }
     session.set_settings_handler(settings_handler(events.clone(), cancelled.clone()));
     session.set_panel_handler(panel_handler(events.clone(), cancelled.clone()));
     session.set_surface_request_handler(Box::new({
@@ -1170,6 +1267,23 @@ fn forward_websites(
     let _ = events.send(HostEvent::Websites(websites));
 }
 
+fn drive_mcp(session:&mut webtools_ipc::HostSession,shared:&Arc<Mutex<McpDispatch>>)->webtools_ipc::Result<()> {
+    let mut dispatch=shared.lock().unwrap(); let now=Instant::now();
+    for reply in session.take_completed_mcp_calls() { dispatch.complete(reply,now); }
+    let cancellations=dispatch.tick(now);
+    for id in cancellations { session.begin_mcp_cancel(&id)?; }
+    if !session.host_ready || session.closing { return Ok(()); }
+    for request in dispatch.pending() {
+        dispatch.mark_submitted(&request.call_id);
+        if let Err(error)=session.begin_mcp_call(&request) {
+            dispatch.complete(webtools_ipc::mcp::McpCallReply::failed(&request.call_id,"failed",&error.to_string()),now);
+        }
+    }
+    if dispatch.needs_sync() { session.request_mcp_sync()?; }
+    if dispatch.take_ownership_changed() { session.sync_ownership_async()?; }
+    Ok(())
+}
+
 fn run(
     command: HostCommand,
     session: &mut webtools_ipc::HostSession,
@@ -1177,6 +1291,33 @@ fn run(
     events: &Sender<HostEvent>,
 ) -> webtools_ipc::Result<()> {
     match command {
+        HostCommand::McpWake => {},
+        HostCommand::ScheduledTask { task, store, owner } => {
+            // Publish the temporary owner before dispatch so Electron cannot
+            // cooperatively exit between callback completion and its reply.
+            let _ = session.sync_ownership();
+            // No replay after an uncertain transport outcome: exactly one attempt per due tick.
+            let still_exists = store.lock().unwrap().list().iter().any(|t| t.plugin_id == task.plugin_id && t.code == task.code);
+            let error = if !still_exists { Some("Task cancelled before execution".into()) } else {
+                match session.request(&webtools_ipc::Envelope::new("plugin-task-trigger", serde_json::json!({
+                    "pluginId":task.plugin_id,"featureId":task.feature_id,"code":task.code,
+                    "scheduledAtMs":task.last_run_ms,"executionId":owner,
+                })), Duration::from_secs(90)) {
+                    Ok(ack) if ack.ok && ack.result.as_ref().is_some_and(|r| r["success"] == true) => None,
+                    Ok(ack) => {
+                        if ack.result.as_ref().is_some_and(|r| r["suspended"] == true) {
+                            let _ = store.lock().unwrap().suspend_plugin(&task.plugin_id, "Plugin unavailable; recreate schedules after enabling and authorizing it");
+                        }
+                        Some(ack.result.as_ref().and_then(|r| r["error"].as_str()).map(str::to_owned)
+                            .or_else(|| ack.error.map(|e| e.message)).unwrap_or_else(|| "Scheduled callback failed".into()))
+                    },
+                    Err(error) => Some(error.to_string()),
+                }
+            };
+            if let Err(error) = store.lock().unwrap().record_result(&task.plugin_id, &task.code, error) { eprintln!("host: cannot save scheduled result: {error}"); }
+            ownership.end_session(&owner);
+            let _ = session.sync_ownership();
+        }
         HostCommand::Shutdown => {}
         HostCommand::ToggleCurrentTemporaryWindow { .. } => {
             if let Some(process_id) = session.hello.as_ref().map(|hello| hello.process_id) {
@@ -1229,6 +1370,11 @@ fn run(
             end_session_after,
         } => {
             let started = Instant::now();
+            if source == "hotkey" {
+                if let Some(process_id) = session.hello.as_ref().map(|hello| hello.process_id) {
+                    crate::visual::allow_foreground_process(process_id);
+                }
+            }
             let result = match selection.as_ref() {
                 Some(selection)
                     if selection.kind == webtools_ipc::projection::ContextKind::Text =>
@@ -1239,10 +1385,11 @@ fn run(
                         &feature,
                         selection.text.as_deref().unwrap_or(""),
                         quick_result,
+                        source,
                     )
                 }
                 Some(selection) => {
-                    session.feature_invoke_with_selection(&request_id, &plugin, &feature, selection)
+                    session.feature_invoke_with_selection(&request_id, &plugin, &feature, selection, source)
                 }
                 None if launcher_text.is_some() => session.feature_invoke_with_launcher_text(
                     &request_id,

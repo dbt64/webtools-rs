@@ -2,7 +2,11 @@
 mod tests {
     #[test]
     fn startup_command_quotes_executable_paths_with_spaces() {
-        assert_eq!(super::startup_command(std::path::Path::new(r"C:\Program Files\WebTools\WebTools.NativeHost.Rust.exe")), r#""C:\Program Files\WebTools\WebTools.NativeHost.Rust.exe""#);
+        let exe = std::path::Path::new(r"C:\Program Files\WebTools\WebTools.NativeHost.Rust.exe");
+        assert_eq!(super::startup_command(exe), r#""C:\Program Files\WebTools\WebTools.NativeHost.Rust.exe" --startup"#);
+        assert!(super::matches_startup_command(r#""C:\Program Files\WebTools\WebTools.NativeHost.Rust.exe""#, exe));
+        assert!(super::matches_startup_command(&super::startup_command(exe), exe));
+        assert!(!super::matches_startup_command(r#""C:\Other\app.exe" --startup"#, exe));
     }
 }
 // Windows login startup for an installed production host.
@@ -17,8 +21,24 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
+pub(crate) fn trace(message: &str) {
+    use std::io::Write;
+    if !std::env::args().any(|arg| arg == "--startup") { return; }
+    let root = crate::config::profile_root();
+    let _ = std::fs::create_dir_all(&root);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(root.join("startup.log")) {
+        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let _ = writeln!(file, "{timestamp} pid={} {message}", std::process::id());
+    }
+}
+
 fn startup_command(exe: &Path) -> String {
-    format!("\"{}\"", exe.display())
+    format!("\"{}\" --startup", exe.display())
+}
+
+fn matches_startup_command(command: &str, exe: &Path) -> bool {
+    command.eq_ignore_ascii_case(&startup_command(exe))
+        || command.eq_ignore_ascii_case(&format!("\"{}\"", exe.display()))
 }
 
 /// A portable preview does not change the installed product's startup entry.
@@ -54,7 +74,13 @@ pub fn enabled() -> io::Result<bool> {
     let result = unsafe { RegGetValueW(HKEY_CURRENT_USER, path.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) };
     if result != ERROR_SUCCESS { return Err(io::Error::from_raw_os_error(result as i32)); }
     let len = buffer.iter().position(|ch| *ch == 0).unwrap_or(buffer.len());
-    Ok(String::from_utf16_lossy(&buffer[..len]).eq_ignore_ascii_case(&startup_command(&std::env::current_exe()?)))
+    let command = String::from_utf16_lossy(&buffer[..len]);
+    let exe = std::env::current_exe()?;
+    let enabled = matches_startup_command(&command, &exe);
+    if enabled && !command.eq_ignore_ascii_case(&startup_command(&exe)) {
+        apply(true)?;
+    }
+    Ok(enabled)
 }
 
 pub fn apply(enabled: bool) -> io::Result<()> {

@@ -14,9 +14,26 @@ import type { PluginRuntimeDiagnostics } from './plugin-runtime-diagnostics.ts'
 import { pluginRuntimeSession } from './plugin-runtime-session.ts'
 import { nextRuntimeGeneration } from './runtime-generation.ts'
 import type { PluginThemeSource } from './plugin-window-theme.ts'
+import { BridgeWireError, type JsonValue } from '../../plugin-sdk/declarative-v1/web/protocol.mjs'
+import type { CapabilityRequest } from '../../plugin-sdk/declarative-v1/web/capability-methods.mjs'
+import type { PluginSearchUiAction } from './plugin-window-chrome-contract.ts'
 
 const LOAD_TIMEOUT_MS = 15_000
 const CLEANUP_TIMEOUT_MS = 5_000
+
+function pluginSearchAction(request: CapabilityRequest): PluginSearchUiAction | null {
+  switch (request.method) {
+    case 'subInput.show': return { type: 'show', placeholder: request.payload.placeholder }
+    case 'subInput.hide': return { type: 'hide' }
+    case 'subInput.getText': return { type: 'get-text' }
+    case 'subInput.setText': return { type: 'set-text', text: request.payload.text }
+    case 'subInput.focus': return { type: 'focus' }
+    case 'subInput.releaseFocus': return { type: 'release-focus' }
+    case 'search.results.update': return { type: 'results-update', ...request.payload }
+    case 'search.results.clear': return { type: 'results-clear', ...request.payload }
+    default: return null
+  }
+}
 
 export type WebRuntimeState = 'ABSENT' | 'CREATING' | 'LOADING' | 'READY' | 'FAULTED' | 'CLOSING' | 'CLOSED'
 export interface WebRuntimeStatus {
@@ -35,6 +52,9 @@ interface RuntimeInstance {
   readonly host: string
   readonly generation: number
   readonly view: WebContentsView
+  lifecycleSubscribed?: boolean
+  entryCount?: number
+  lifecycleVisible?: boolean
   state: WebRuntimeState
   removeView: boolean
   rejectLoad?: (error: Error) => void
@@ -47,6 +67,8 @@ interface RuntimeInstance {
   removeBridgeListener?: () => void
   removePreloadErrorListener?: () => void
   authority?: WebFeatureAuthority
+  ownsAuthority?: boolean
+  windowId?: string
   capabilities?: WebHostCapabilities
   removeAuthorityListener?: () => void
   gestureAt?: number
@@ -76,6 +98,25 @@ export class WebPluginRuntime {
   private unavailable = false
   private operationQueue: Promise<void> = Promise.resolve()
   private readonly listeners = new Set<(status: WebRuntimeStatus) => void>()
+  private taskSubscribed = false
+  private scheduledWork?: { event: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger; resolve(): void; reject(error: Error): void; published: boolean }
+
+  /** Used only by an execution-owned hidden runtime, never a user's open window. */
+  async runScheduledTask(event: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger): Promise<void> {
+    if (this.scheduledWork || this.active?.state !== 'READY') throw new Error('Scheduled runtime unavailable')
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.scheduledWork = { event, resolve, reject, published: false }
+        timer = setTimeout(() => reject(new Error('Scheduled callback timed out after 30 seconds (register tasks.onTrigger during initialization)')), 30_000)
+        this.publishScheduledTask()
+      })
+    } finally { clearTimeout(timer); this.scheduledWork = undefined }
+  }
+  private publishScheduledTask(): void {
+    const work = this.scheduledWork
+    if (work && this.taskSubscribed && !work.published) { work.published = true; this.active?.bridge?.publishEvent('tasks.trigger', work.event) }
+  }
 
   constructor(getWindow: () => BrowserWindow | null, runtimeTestOptions: WebRuntimeTestOptions = {},
     getCapabilityDependencies?: (authority?: WebFeatureAuthority, window?: BrowserWindow) => { store: PluginStore; effects: Omit<WebCapabilityEffects, 'hasForegroundGesture'> } | null,
@@ -84,7 +125,9 @@ export class WebPluginRuntime {
     private readonly themeSource?: PluginThemeSource,
     private readonly handleWindowEscape?: (window: BrowserWindow, input: { key: string; type: string; isAutoRepeat?: boolean; control?: boolean; meta?: boolean; alt?: boolean; shift?: boolean }) => boolean,
     private readonly handlePluginMouseDown?: (window: BrowserWindow, point: { x: number; y: number }) => void,
-    private readonly startupStage?: (stage: string, frame?: NativeImage) => void) {
+    private readonly startupStage?: (stage: string, frame?: NativeImage) => void,
+    private readonly dispatchPluginSearch?: (window: BrowserWindow, action: PluginSearchUiAction) => JsonValue | undefined | Promise<JsonValue | undefined>,
+    private readonly dispatchPluginWindow?: (window: BrowserWindow, windowId: string, request: CapabilityRequest) => Promise<JsonValue>) {
     this.getWindow = getWindow
     this.runtimeTestOptions = runtimeTestOptions
     this.getCapabilityDependencies = getCapabilityDependencies
@@ -100,6 +143,8 @@ export class WebPluginRuntime {
     const active = this.active
     return active ? this.describe(active) : Object.freeze({ state: this.unavailable ? 'CLOSED' : 'ABSENT', generation: this.generation })
   }
+
+  authorityForWindow(): WebFeatureAuthority | undefined { return this.active?.authority }
 
   setBounds(bounds: Rectangle): void {
     const active = this.active
@@ -118,14 +163,32 @@ export class WebPluginRuntime {
     active.view.setVisible(visible)
   }
 
-  openAuthority(authority: WebFeatureAuthority, context?: InvocationTextContext): Promise<WebRuntimeStatus> {
+  publishSearchInput(value: string, revision: number): void {
+    const runtime = this.active
+    if (runtime?.state === 'READY' && runtime.generation === this.generation) runtime.bridge?.publishEvent('subInput.change', { value, revision })
+  }
+
+  publishWindowMessage(from: string, data: JsonValue): void {
+    if (this.active?.state === 'READY') this.active.bridge?.publishEvent('window.message', { from, data })
+  }
+
+  publishWindowClosed(id: string): void {
+    if (this.active?.state === 'READY') this.active.bridge?.publishEvent('window.closed', { id })
+  }
+
+  publishSearchSelection(selection: { id: string; query: string; revision: number; item: { id: string; title: string; description: string; icon: string } }): void {
+    const runtime = this.active
+    if (runtime?.state === 'READY' && runtime.generation === this.generation) runtime.bridge?.publishEvent('search.result-selected', selection)
+  }
+
+  openAuthority(authority: WebFeatureAuthority, context?: InvocationTextContext, options: { windowId?: string; ownsAuthority?: boolean; document?: string } = {}): Promise<WebRuntimeStatus> {
     tracePluginRuntimeAcceptance('runtime-open-authority', { pluginId: authority.snapshot.manifest.id, featureId: authority.featureId })
     if (!isWebFeatureAuthority(authority) || !authority.isCurrent()) return Promise.reject(new Error('Web Feature authority unavailable'))
-    return this.open(authority.snapshot, authority.featureId, { authority, context, receivedAtUnixMs: Date.now() })
+    return this.open(authority.snapshot, authority.featureId, { authority, context, receivedAtUnixMs: Date.now(), ...options })
   }
 
   async open(snapshot: ValidatedPluginRuntimeSnapshot, featureId: string,
-    invocation?: { authority: WebFeatureAuthority; context?: InvocationTextContext; receivedAtUnixMs: number }): Promise<WebRuntimeStatus> {
+    invocation?: { authority: WebFeatureAuthority; context?: InvocationTextContext; receivedAtUnixMs: number; windowId?: string; ownsAuthority?: boolean; document?: string }): Promise<WebRuntimeStatus> {
     tracePluginRuntimeAcceptance('runtime-open-queued', { pluginId: snapshot.manifest.id, featureId })
     const requestGeneration = ++this.requestGeneration
     const diagnosticRequest: { generation?: number } = {}
@@ -154,7 +217,7 @@ export class WebPluginRuntime {
   }
 
   private async openInternal(snapshot: ValidatedPluginRuntimeSnapshot, featureId: string, requestGeneration: number,
-    invocation?: { authority: WebFeatureAuthority; context?: InvocationTextContext; receivedAtUnixMs: number },
+    invocation?: { authority: WebFeatureAuthority; context?: InvocationTextContext; receivedAtUnixMs: number; windowId?: string; ownsAuthority?: boolean; document?: string },
     diagnosticRequest: { generation?: number } = {}): Promise<WebRuntimeStatus> {
     tracePluginRuntimeAcceptance('runtime-open-internal', { pluginId: snapshot.manifest.id, featureId })
     // Crash teardown starts outside operationQueue; replacement must still wait for it.
@@ -166,6 +229,8 @@ export class WebPluginRuntime {
     if (invocation && (!isWebFeatureAuthority(invocation.authority) || !invocation.authority.isCurrent()
       || invocation.authority.snapshot !== snapshot || invocation.authority.featureId !== featureId)) throw new Error('Web Feature authority unavailable')
     const selection = selectValidatedWebFeature(snapshot, featureId)
+    const entryPath = invocation?.document ?? selection.entryPath
+    if (!snapshot.inventory.some(item => item.canonicalPath === entryPath && item.mimeType === 'text/html')) throw new Error('Custom window entry is not a packaged HTML document')
     const existing = this.active
     if (existing && !invocation && !existing.authority && existing.snapshot.packageHash === snapshot.packageHash && existing.featureId === featureId && existing.state === 'READY') return this.status
     // This method already runs inside operationQueue; enqueueing close() here would await itself.
@@ -206,6 +271,7 @@ export class WebPluginRuntime {
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: true,
+      backgroundThrottling: false,
       webviewTag: false,
       allowRunningInsecureContent: false,
       devTools: false,
@@ -214,7 +280,10 @@ export class WebPluginRuntime {
         ...(isAcceptanceRuntime() ? ['--plugin-runtime-acceptance'] : []),
         ...(invocation ? [
           ...(invocation.authority.isCurrent('sharedAI.complete') ? ['--webtools-plugin-ai'] : []),
-          ...(invocation.authority.isCurrent('clipboard.write') ? ['--webtools-plugin-clipboard'] : []),
+          ...(invocation.authority.isCurrent('clipboard.write') || invocation.authority.isCurrent('clipboard.current.read') ? ['--webtools-plugin-clipboard'] : []),
+          ...(invocation.authority.isCurrent('system.notification') || invocation.authority.isCurrent('system.input.paste') || invocation.authority.isCurrent('system.screen.capture') || invocation.authority.isCurrent('system.browser.automation') || invocation.authority.isCurrent('system.media.image') || invocation.authority.isCurrent('system.media.transcode') ? ['--webtools-plugin-system'] : []),
+          ...(invocation.authority.isCurrent('system.file.select') || invocation.authority.isCurrent('system.path.open') ? ['--webtools-plugin-files'] : []),
+          ...(invocation.authority.isCurrent('plugin.window.manage') ? ['--webtools-plugin-windows', `--webtools-plugin-window-id=${invocation.windowId ?? 'main'}`] : []),
         ] : []),
         ...(nodePreload ? [`--webtools-plugin-runtime=${Buffer.from(JSON.stringify(nodePreload)).toString('base64url')}`] : []),
       ],
@@ -222,8 +291,9 @@ export class WebPluginRuntime {
     const runtime: RuntimeInstance = {
       snapshot, featureId, feature: selection.feature, host: identity.host,
       generation: runtimeGeneration, view, state: 'CREATING', removeView: false,
-      entryUrl: buildRuntimeResourceUrl(identity.host, selection.entryPath), documentLoaded: false, initialNavigationStarted: false,
+      entryUrl: buildRuntimeResourceUrl(identity.host, entryPath), documentLoaded: false, initialNavigationStarted: false,
       authority: invocation?.authority,
+      ownsAuthority: invocation?.ownsAuthority !== false, windowId: invocation?.windowId ?? 'main',
     }
     this.active = runtime
     if (invocation && capabilityDependencies) {
@@ -272,7 +342,49 @@ export class WebPluginRuntime {
         void this.closeRuntime(runtime)
       },
       dispatchPing: this.runtimeTestOptions.dispatchPing,
-      dispatchCapability: runtime.capabilities ? (request, signal) => runtime.capabilities!.dispatch(request, signal) : undefined,
+      dispatchCapability: async (request, signal) => {
+        if (request.method === 'tasks.subscribe') {
+          if (!runtime.authority?.isCurrent('plugin.tasks')) throw new BridgeWireError('PERMISSION_DENIED')
+          this.taskSubscribed = true; this.publishScheduledTask(); return null
+        }
+        if (request.method === 'tasks.complete') {
+          const work = this.scheduledWork
+          if (!work || !work.published || work.event.executionId !== request.payload.executionId || !runtime.authority?.isCurrent('plugin.tasks')) throw new BridgeWireError('STALE_RUNTIME')
+          if (request.payload.error === null) work.resolve(); else work.reject(new Error(request.payload.error))
+          return null
+        }
+        if (request.method.startsWith('window.')) {
+          if (signal.aborted) throw new BridgeWireError('CANCELLED')
+          const owner = this.getWindow()
+          if (!owner || owner.isDestroyed() || this.active !== runtime || runtime.state !== 'READY') throw new BridgeWireError('RUNTIME_CLOSED')
+          if (!runtime.authority?.isCurrent('plugin.window.manage')) throw new BridgeWireError('PERMISSION_DENIED')
+          if (!this.dispatchPluginWindow) throw new BridgeWireError('NOT_AVAILABLE')
+          return this.dispatchPluginWindow(owner, runtime.windowId ?? 'main', request)
+        }
+        if (request.method === 'lifecycle.subscribe') {
+          if (this.active !== runtime || runtime.state !== 'READY') throw new BridgeWireError('RUNTIME_CLOSED')
+          runtime.lifecycleSubscribed = true
+          if (runtime.entryCount) {
+            runtime.bridge?.publishEvent('lifecycle.changed', { phase: 'enter', featureId: runtime.featureId,
+              generation: runtime.generation, entryCount: runtime.entryCount })
+            if (runtime.lifecycleVisible !== undefined) runtime.bridge?.publishEvent('lifecycle.changed', {
+              phase: runtime.lifecycleVisible ? 'show' : 'hide', featureId: runtime.featureId,
+              generation: runtime.generation, entryCount: runtime.entryCount })
+          }
+          return null
+        }
+        const action = pluginSearchAction(request)
+        if (action) {
+          if (signal.aborted) throw new BridgeWireError('CANCELLED')
+          const owner = this.getWindow()
+          if (!owner || owner.isDestroyed() || this.active !== runtime || runtime.state !== 'READY') throw new BridgeWireError('RUNTIME_CLOSED')
+          const result = await this.dispatchPluginSearch?.(owner, action)
+          if (result === undefined) throw new BridgeWireError('NOT_AVAILABLE')
+          return result
+        }
+        if (!runtime.capabilities) throw new BridgeWireError('NOT_AVAILABLE')
+        return runtime.capabilities.dispatch(request, signal)
+      },
     })
     const receive = (event: Electron.IpcMainEvent, raw: unknown) => runtime.bridge?.receive(event, raw)
     ipcMain.on(PLUGIN_BRIDGE_CLIENT_ROUTE, receive)
@@ -361,7 +473,30 @@ export class WebPluginRuntime {
     const active = this.active
     if (active?.state === 'READY' && !active.view.webContents.isDestroyed()) active.view.webContents.focus()
   }
-  updateContext(context?: InvocationTextContext): void { this.active?.capabilities?.setContext(context) }
+  notifyEnter(): void {
+    const runtime = this.active
+    if (!runtime || runtime.state !== 'READY') return
+    runtime.entryCount = (runtime.entryCount ?? 0) + 1
+    if (runtime.lifecycleSubscribed) runtime.bridge?.publishEvent('lifecycle.changed', { phase: 'enter', featureId: runtime.featureId,
+      generation: runtime.generation, entryCount: runtime.entryCount })
+    const window = this.getWindow()
+    if (window && !window.isDestroyed()) this.notifyVisibility(window.isVisible() && !window.isMinimized())
+  }
+  notifyVisibility(visible: boolean): void {
+    const runtime = this.active
+    if (!runtime || runtime.state !== 'READY' || !runtime.entryCount || runtime.lifecycleVisible === visible) return
+    // A newly created, still hidden window has not been presented yet.
+    if (runtime.lifecycleVisible === undefined && !visible) return
+    runtime.lifecycleVisible = visible
+    if (runtime.lifecycleSubscribed) runtime.bridge?.publishEvent('lifecycle.changed', { phase: visible ? 'show' : 'hide', featureId: runtime.featureId,
+      generation: runtime.generation, entryCount: runtime.entryCount })
+  }
+  updateContext(context?: InvocationTextContext): void {
+    const runtime = this.active
+    if (!runtime?.capabilities) return
+    runtime.capabilities.setContext(context)
+    runtime.bridge?.publishEvent('context.changed', null)
+  }
 
   async clearPluginData(pluginId: string): Promise<void> {
     if (!/^[a-z0-9]+(?:[.-][a-z0-9]+)*$/.test(pluginId) || pluginId.length > 128) throw new TypeError('Invalid plugin identity')
@@ -590,6 +725,7 @@ export class WebPluginRuntime {
 
   private closeRuntime(runtime: RuntimeInstance): Promise<void> {
     if (runtime.closePromise) return runtime.closePromise
+    if (this.active === runtime) { this.scheduledWork?.reject(new Error('Scheduled runtime cancelled')); this.taskSubscribed = false }
     traceAcceptanceRuntime('close-requested', { state: runtime.state, featureId: runtime.featureId, stack: new Error().stack })
     runtime.closePromise = this.performCloseRuntime(runtime)
     this.pendingTeardown = runtime.closePromise
@@ -605,7 +741,7 @@ export class WebPluginRuntime {
     runtime.gestureAt = undefined
     runtime.removeAuthorityListener?.(); runtime.removeAuthorityListener = undefined
     runtime.capabilities?.dispose(); runtime.capabilities = undefined
-    runtime.authority?.revoke()
+    if (runtime.ownsAuthority !== false) runtime.authority?.revoke()
     const bridgeClosed = runtime.bridge?.revoke()
     runtime.removeBridgeListener?.()
     runtime.removeBridgeListener = undefined

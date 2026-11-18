@@ -10,11 +10,12 @@ import { PluginManager } from './plugin-manager.ts'
 import { isWebFeatureAuthority } from './web-feature-authority.ts'
 import { runtimeV3Manifest, runtimeV3Package } from './fixtures.mjs'
 import { PluginThemeController } from './plugin-theme-controller.ts'
+import { DEFAULT_HOST_HEIGHT, DEFAULT_HOST_WIDTH } from '../services/host-window-geometry.ts'
 
 const source = stripTypeScriptTypes((await readFile(new URL('./plugin-window-manager.ts', import.meta.url), 'utf8'))
   .replace(/^import .*\r?\n/gm, '').replace('export class PluginWindowManager', 'class PluginWindowManager'), { mode: 'transform' })
 
-function focusHarness({ deferRuntimeOpen = false } = {}) {
+function focusHarness({ deferRuntimeOpen = false, shellSetsOpacity = false } = {}) {
   const windows = []
   const handoffOrder = []
   let returned = 0
@@ -23,39 +24,49 @@ function focusHarness({ deferRuntimeOpen = false } = {}) {
   let failNextOpen = false
   let finishRuntimeOpen
   let runtimeOpenStarted = false
+  const lifecycle = []
+  const runtimeOpenOptions = []
   const runtimeBounds = []
   const runtimeVisibility = []
   class Window extends EventEmitter {
-    constructor(options) { super(); this.options = options; this.visible = false; this.focused = false; this.minimized = false; this.destroyed = false;
+    constructor(options) { super(); this.options = options; this.visible = false; this.focused = false; this.minimized = false; this.destroyed = false; this.opacity = 1;
       this.webContents = Object.assign(new EventEmitter(), { setWindowOpenHandler() {}, isDestroyed() { return false }, send() {} }); windows.push(this) }
     isDestroyed() { return this.destroyed }
     isMinimized() { return this.minimized }
     isMaximized() { return false }
     isFocused() { return this.focused }
+    isEnabled() { return this.enabled !== false }
     restore() { this.minimized = false }
     moveTop() {}
-    show() { this.visible = true }
-    hide() { this.visible = false; this.focused = false }
+    show() { const changed = !this.visible; this.visible = true; if (changed) this.emit('show') }
+    hide() { const changed = this.visible; this.visible = false; this.focused = false; if (changed) this.emit('hide') }
     focus() { if (this.refuseFocus) return; for (const w of windows) if (w !== this && w.focused) w.blur(); this.focused = true; this.emit('focus') }
     blur() { this.focused = false; this.emit('blur') }
     minimize() { this.blur(); this.minimized = true; this.emit('minimize') }
-    setTitle() {} setIcon() {} setBackgroundColor() {} setMenu() {}
+    setTitle(value) { this.title = value } setIcon() {} setBackgroundColor() {} setMenu() {}
+    setSkipTaskbar(value) { this.skipTaskbar = value } setAlwaysOnTop(value) { this.alwaysOnTop = value }
+    setOpacity(value) { this.opacity = value }
+    getBounds() { return this.bounds ?? { x: 20, y: 20, width: this.options.width ?? 960, height: this.options.height ?? 680 } }
+    setBounds(value) { this.bounds = value }
     getContentSize() { return [960, 680] }
     destroy() { handoffOrder.push('plugin-destroy'); this.destroyed = true; this.visible = false; this.emit('closed') }
   }
-  const Windows = runInNewContext(`${source}\nPluginWindowManager`, { BrowserWindow: Window,
+  const Windows = runInNewContext(`${source}\nPluginWindowManager`, { BrowserWindow: Window, DEFAULT_HOST_HEIGHT, DEFAULT_HOST_WIDTH,
+    randomUUID: () => 'business-window-1', BridgeWireError: class extends Error {},
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }), createFromBuffer: () => ({ isEmpty: () => true }) },
     PLUGIN_WINDOW_CHROME_CHANNELS: { state: 'state' },
     isWebFeatureAuthority: () => true,
     screen: { getCursorScreenPoint: () => ({}), getDisplayNearestPoint: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }) }, Date, console, setImmediate })
   const owner = new Windows({ theme: { current: { backgroundColor: '#fff' }, subscribe: () => () => {} }, defaultIcon: 'app.ico', onSurfacesChanged() {},
+    loadChrome: async window => { if (shellSetsOpacity) window.setOpacity(0) },
     hasPendingHostDialogs: () => pendingDialogs, returnToLauncher: () => { returned++; handoffOrder.push('launcher-shown'); return returnApproval },
     prepareLauncherFocus: async () => { handoffOrder.push('foreground-permission-granted') },
     focusLauncher: async () => { handoffOrder.push('launcher-focused') }, createRuntime: () => {
       const listeners = new Set()
       const failOpen = failNextOpen; failNextOpen = false
       return { status: { state: 'ABSENT' }, closes: 0, subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) },
-        async openAuthority() {
+        async openAuthority(_authority, _context, options) {
+          runtimeOpenOptions.push(options)
           if (failOpen) throw new Error('Activation failed')
           runtimeOpenStarted = true
           if (deferRuntimeOpen) {
@@ -67,17 +78,98 @@ function focusHarness({ deferRuntimeOpen = false } = {}) {
         },
         async close() { this.closes++; await Promise.resolve(); this.status = { state: 'CLOSED' }; for (const fn of listeners) fn(this.status) },
         setBounds(bounds) { runtimeBounds.push(bounds) }, setVisible(visible) { runtimeVisibility.push(visible) },
-        focus() {}, updateContext() {} }
+        focus() {}, authorityForWindow() { return { isCurrent: () => true, snapshot: { inventory: [{ canonicalPath: 'web/child.html', mimeType: 'text/html' }] } } }, publishWindowClosed() {}, publishWindowMessage() {}, updateContext(value) { lifecycle.push(['context', value]) }, notifyEnter() { lifecycle.push(['enter']) }, notifyVisibility(value) { lifecycle.push([value ? 'show' : 'hide']) } }
     } })
-  const open = (blurBehavior = 'temporary-hide', sessionId, featureId = 'home') => owner.open({ snapshot: {
+  const open = (blurBehavior = 'temporary-hide', sessionId, featureId = 'home', context) => owner.open({ snapshot: {
     packageHash: 'hash', manifest: { manifestVersion: 3, id: 'org.example.focus', name: 'Focus', features: [{ id: featureId, title: featureId, presentation: { type: 'window', blurBehavior } }] } },
-    featureId, ...(sessionId ? { development: { sessionId } } : {}), isCurrent: () => true, revoke() {} })
+    featureId, ...(sessionId ? { development: { sessionId } } : {}), isCurrent: () => true, revoke() {} }, context)
   const createManager = () => { const window = new Window({}); owner.registerManagerWindow(window, async () => window.destroy()); window.show(); window.focus(); return window }
-  return { owner, windows, open, createManager, finishRuntimeOpen() { finishRuntimeOpen?.() }, runtimeBounds, runtimeVisibility, handoffOrder,
+  return { owner, windows, open, createManager, lifecycle, runtimeOpenOptions, finishRuntimeOpen() { finishRuntimeOpen?.() }, runtimeBounds, runtimeVisibility, handoffOrder,
     get runtimeOpenStarted() { return runtimeOpenStarted }, failNextOpen() { failNextOpen = true },
     setReturn(value) { returnApproval = value }, setDialogs(value) { pendingDialogs = value }, get returned() { return returned } }
 }
 const settleBlur = () => new Promise(resolve => setImmediate(resolve))
+
+test('ordinary plugin uses the shared default host size', async () => {
+  const h = focusHarness()
+  await h.open()
+  assert.equal(h.windows[0].options.width, DEFAULT_HOST_WIDTH)
+  assert.equal(h.windows[0].options.height, DEFAULT_HOST_HEIGHT)
+  await h.owner.closeAll()
+})
+
+test('plugin business windows share the feature runtime, can be managed, and close with their owner', async () => {
+  const h = focusHarness()
+  await h.open()
+  const parent = h.windows[0]
+  const created = await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.create', payload: { title: 'Preview', width: 640, height: 420 } })
+  assert.equal(typeof created.id, 'string')
+  const child = h.windows[1]
+  assert.equal(child.options.parent, parent)
+  assert.equal(child.options.title, 'Preview')
+  assert.equal(child.options.width, 640)
+  assert.equal(child.options.height, 420)
+  assert.equal(child.options.skipTaskbar, true)
+  assert.equal(child.options.frame, false)
+  assert.equal(h.owner.getChromeState(child).customWindow, true)
+  assert.equal(child.visible, true)
+
+  await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.setBounds', payload: { id: created.id, x: 90, y: 70, width: 700, height: 460 } })
+  assert.deepEqual({ ...child.bounds }, { x: 90, y: 70, width: 700, height: 460 })
+  await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.setAlwaysOnTop', payload: { id: created.id, enabled: true } })
+  assert.equal(child.alwaysOnTop, true)
+  await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.hide', payload: { id: created.id } })
+  assert.equal(child.visible, false)
+  await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.show', payload: { id: created.id } })
+  assert.equal(child.visible, true)
+
+  await h.owner.closePlugin('org.example.focus')
+  assert.equal(child.destroyed, true)
+  assert.equal(parent.destroyed, true)
+  assert.equal(h.owner.hasSurfaces, false)
+})
+
+test('business windows can load a packaged child page and select frameless or native chrome', async () => {
+  for (const [chrome, expectedFrame] of [['frameless', false], ['native', true]]) {
+    const h = focusHarness()
+    await h.open()
+    const parent = h.windows[0]
+    await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.create', payload: { document: 'web/child.html', chrome } })
+    assert.equal(h.windows[1].options.frame, expectedFrame)
+    assert.equal(h.runtimeOpenOptions[1].document, 'web/child.html')
+    assert.equal(h.owner.getChromeState(h.windows[1]), null)
+    await h.owner.closeAll()
+  }
+  const h = focusHarness()
+  await h.open()
+  await assert.rejects(() => h.owner.dispatchPluginWindow(h.windows[0], 'main', { method: 'window.create', payload: { document: 'web/missing.html' } }))
+  assert.equal(h.windows.length, 1)
+  await h.owner.closeAll()
+})
+
+test('host title bar controls only the custom window and keeps the plugin main window alive', async () => {
+  const h = focusHarness()
+  await h.open()
+  const parent = h.windows[0]
+  await h.owner.dispatchPluginWindow(parent, 'main', { method: 'window.create', payload: { title: 'Details' } })
+  const child = h.windows[1]
+  assert.equal(await h.owner.performChromeAction(child, 'pin'), true)
+  assert.equal(child.alwaysOnTop, true)
+  assert.equal(h.owner.getChromeState(child).alwaysOnTop, true)
+  assert.equal(await h.owner.performChromeAction(child, 'close'), true)
+  assert.equal(child.destroyed, true)
+  assert.equal(parent.destroyed, false)
+  await h.owner.closeAll()
+})
+
+test('business window becomes visible after shell loading sets opacity to zero', async () => {
+  const h = focusHarness({ shellSetsOpacity: true })
+  await h.open()
+  await h.owner.dispatchPluginWindow(h.windows[0], 'main', { method: 'window.create', payload: { title: 'Preview' } })
+  assert.equal(h.windows[1].visible, true)
+  assert.equal(h.windows[1].opacity, 1)
+  await h.owner.closeAll()
+})
 
 test('plugin activation starts immediately but the window stays hidden until its runtime is ready', async () => {
   const h = focusHarness({ deferRuntimeOpen: true })
@@ -150,6 +242,16 @@ test('manual minimize and modal blur preserve the window until final owner focus
   window.blur(); h.owner.hostDialogsClosed(window); await settleBlur()
   assert.equal(window.visible, false)
   assert.equal(h.owner.focusCurrentTemporaryWindow(), true)
+  await h.owner.closeAll()
+})
+
+test('native file chooser disables its parent without hiding the plugin; ordinary blur still hides', async () => {
+  const h = focusHarness(); await h.open(); const window = h.windows[0]
+  window.enabled = false; window.blur(); await settleBlur()
+  assert.equal(window.visible, true)
+  window.enabled = true; window.focus()
+  window.blur(); await settleBlur()
+  assert.equal(window.visible, false)
   await h.owner.closeAll()
 })
 
@@ -331,7 +433,7 @@ test('Plugin Window follows theme without replacing the window, altering geometr
     destroy() { this.destroyed = true; this.emit('closed') }
   }
   const Windows = runInNewContext(`${source}\nPluginWindowManager`, {
-    BrowserWindow: Window, nativeImage: { createFromPath: () => ({ isEmpty: () => true }), createFromBuffer: () => ({ isEmpty: () => true }) },
+    BrowserWindow: Window, DEFAULT_HOST_HEIGHT, DEFAULT_HOST_WIDTH, nativeImage: { createFromPath: () => ({ isEmpty: () => true }), createFromBuffer: () => ({ isEmpty: () => true }) },
     PLUGIN_WINDOW_CHROME_CHANNELS: { state: 'state' }, isWebFeatureAuthority,
     screen: { getCursorScreenPoint: () => ({ x: 0, y: 0 }), getDisplayNearestPoint: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }) },
     Date, console,
@@ -342,14 +444,14 @@ test('Plugin Window follows theme without replacing the window, altering geometr
       subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
       async openAuthority(authority) { this.authority = authority; this.status = { state: 'READY' }; for (const listener of listeners) listener(this.status) },
       async close() { this.authority?.revoke(); await Promise.resolve(); this.status = { state: 'CLOSED' }; for (const listener of listeners) listener(this.status) },
-      setBounds() {}, setVisible() {}, focus() {}, updateContext() {},
+      setBounds() {}, setVisible() {}, focus() {}, updateContext() {}, notifyEnter() {}, notifyVisibility() {},
     }
   } })
   const open = async () => { const dispatch = await manager.authorizeWebFeature({ pluginId: runtimeV3Manifest().id, featureId: 'hello' }, manager.session, authority => owner.open(authority)); await dispatch.completion }
   await open()
   assert.equal(windows[0].options.backgroundColor, '#f3f5f8')
-  assert.equal(windows[0].options.width, 960)
-  assert.equal(windows[0].options.height, 680)
+  assert.equal(windows[0].options.width, DEFAULT_HOST_WIDTH)
+  assert.equal(windows[0].options.height, DEFAULT_HOST_HEIGHT)
   assert.equal(windows[0].visible, true)
   preference = 'dark'; theme.refresh()
   assert.equal(windows[0].background, '#0b0c0e')
@@ -360,4 +462,25 @@ test('Plugin Window follows theme without replacing the window, altering geometr
   assert.equal(owner.hasSurfaces, false)
   preference = 'light'; theme.refresh()
   assert.equal(windows[0].background, '#0b0c0e')
+})
+
+
+test('retained window receives refreshed context before enter, while summon only changes visibility', async () => {
+  const h = focusHarness()
+  await h.open()
+  assert.deepEqual(h.lifecycle, [['enter'], ['show']])
+  const window = h.windows[0]
+  window.blur(); await settleBlur()
+  assert.equal(h.lifecycle.at(-1)[0], 'hide')
+  await h.owner.focusCurrentTemporaryWindowAndWait()
+  assert.equal(h.lifecycle.at(-1)[0], 'show')
+  assert.equal(h.lifecycle.filter(item => item[0] === 'enter').length, 1)
+  window.blur(); await settleBlur()
+  h.lifecycle.length = 0
+  await h.open('temporary-hide', undefined, 'home', { type: 'text', source: 'selected-text', text: 'new selection', ageMs: 0 })
+  assert.equal(h.lifecycle[0][0], 'context')
+  assert.equal(h.lifecycle[0][1].text, 'new selection')
+  assert.deepEqual(h.lifecycle.slice(1), [['enter'], ['show']])
+  assert.equal(h.windows.length, 1)
+  await h.owner.closeAll()
 })

@@ -126,6 +126,7 @@ mod tests {
                 title: "翻译".into(),
                 commands: vec!["translate".into()],
                 accepted_contexts: vec![AcceptedContext {
+                    min_items: None,
                     kind: ContextKind::Text,
                     sources: vec!["selected-text".into()],
                     extensions: None,

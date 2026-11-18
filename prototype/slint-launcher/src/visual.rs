@@ -25,12 +25,24 @@ fn local_rank(score: i32, application: bool, remembered: bool) -> i32 {
     } else {
         0
     };
-    score + source_bonus + if remembered { 25 } else { 0 }
+    // The exact query's successful selection may cross one 50-point match tier,
+    // while weak aliases/metadata still cannot displace a direct name match.
+    score + source_bonus + if remembered { 75 } else { 0 }
 }
 
 #[cfg(test)]
 mod ranking_tests {
     use super::{index, local_rank};
+
+    #[test]
+    fn a_query_selection_can_beat_a_neighboring_exact_name_match() {
+        for (name, preferred) in [("Clash", "Clash Verge"), ("Editor", "Editor Pro"), ("终端", "终端工具")] {
+            let exact = index::score_entry(name, &[], "", name).unwrap();
+            let prefix = index::score_entry(preferred, &[], "", name).unwrap();
+            assert!(local_rank(prefix, true, true) > local_rank(exact, true, false), "{preferred}");
+            assert!(local_rank(prefix, true, false) < local_rank(exact, true, false));
+        }
+    }
 
     #[test]
     fn application_initials_beat_website_prefix_for_normal_search() {
@@ -1056,6 +1068,39 @@ pub fn restore_foreground(hwnd: isize) -> bool {
         eprintln!("focus: hwnd=0x{hwnd:x} requested={requested} foreground=0x{foreground:x} active={active}");
     }
     active
+}
+
+/// Launcher activation is not complete until its UI thread owns keyboard focus.
+/// Foreground ownership alone can be true after startup/window handoff while
+/// GetFocus() is null. Only operate on our own UI-thread HWND.
+pub fn focus_launcher_window(hwnd: isize) -> bool {
+    unsafe {
+        use windows_sys::Win32::{
+            System::Threading::{AttachThreadInput, GetCurrentThreadId},
+            UI::{Input::KeyboardAndMouse::{GetFocus, SetFocus},
+                WindowsAndMessaging::{GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow}},
+        };
+        let current_thread = GetCurrentThreadId();
+        if hwnd == 0 || GetWindowThreadProcessId(hwnd as _, std::ptr::null_mut()) != current_thread
+            || IsWindowVisible(hwnd as _) == 0 { return false; }
+        if current_foreground() != hwnd {
+            SetForegroundWindow(hwnd as _);
+            if current_foreground() != hwnd {
+                // A tray startup or asynchronous Manager roundtrip may not retain
+                // the hotkey's foreground allowance. Pair this short attachment;
+                // never keep another application's input queue attached.
+                let foreground_thread = GetWindowThreadProcessId(current_foreground() as _, std::ptr::null_mut());
+                if foreground_thread != 0 && foreground_thread != current_thread
+                    && AttachThreadInput(current_thread, foreground_thread, 1) != 0 {
+                    SetForegroundWindow(hwnd as _);
+                    AttachThreadInput(current_thread, foreground_thread, 0);
+                }
+            }
+        }
+        if current_foreground() != hwnd { return false; }
+        SetFocus(hwnd as _);
+        current_foreground() == hwnd && GetFocus() as isize == hwnd
+    }
 }
 
 pub fn panel_noactivate() {

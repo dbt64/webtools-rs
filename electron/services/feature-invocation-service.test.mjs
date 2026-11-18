@@ -120,6 +120,18 @@ test('Web Feature invocation goes through live authority and typed context expir
   assert.equal((await env.service.invoke({ ...value, requestId: 'eec8790c-1b26-428e-b41f-33acdb9d3fb5' })).reasonCode, 'stale-request')
   assert.equal(calls, 1)
 })
+test('plugin hotkey forwards its source and selected file to the feature', async () => {
+  let captured
+  const env = setup({ now: () => 100000,
+    authorizeWeb: async (ref, dispatch) => ({ completion: dispatch({ featureId: ref.featureId }) }),
+    activateWebFeature: async (ref, context, source) => { captured = { ref, context, source } },
+  })
+  const ref = { pluginId: 'org.example.web', featureId: 'hello' }
+  const context = { type: 'files', source: 'explorer-selection', items: [{ kind: 'file', path: 'C:\\sample.png' }], capturedAtUnixMs: 100000 }
+  assert.equal((await env.service.invoke({ requestId: id, ref, source: 'hotkey', context })).status, 'accepted')
+  assert.equal(captured.source, 'hotkey')
+  assert.deepEqual(captured.context.items, context.items)
+})
 test('completed invocation replay retains no plaintext context while preserving exact at-most-once discrimination', async () => {
   let calls = 0
   const env = setup({ now: () => 100000, authorizeWeb: async (ref, dispatch) => { calls++; return { completion: dispatch({ featureId: ref.featureId }) } }, openWeb: async () => {} })

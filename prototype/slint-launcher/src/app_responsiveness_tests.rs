@@ -31,7 +31,7 @@ fn isolated_app() -> Rc<NativeApp> {
     unsafe {
         windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(-4isize as _);
     }
-    visual::native_backend("software").select().unwrap();
+    visual::native_backend(&std::env::var("WT_FOCUS_PROBE_RENDERER").unwrap_or_else(|_| "software".into())).select().unwrap();
     let (events, receiver) = mpsc::channel();
     let app = Rc::new(NativeApp {
         launcher: Baseline::new().unwrap(),
@@ -45,6 +45,7 @@ fn isolated_app() -> Rc<NativeApp> {
         launcher_icons: RefCell::new(std::collections::HashMap::new()),
         config: Config::default(),
         runtime: RefCell::new(None),
+        mcp_server: RefCell::new(None),
         ownership: webtools_ipc::HostOwnership::default(),
         active_session: RefCell::new(None),
         pending_handoff: RefCell::new(None),
@@ -54,7 +55,8 @@ fn isolated_app() -> Rc<NativeApp> {
         host_events: RefCell::new(None),
         events,
         receiver,
-        external: Cell::new(0),
+        external: Cell::new(crate::paste_target::PasteTarget::default()),
+        pending_launcher_origin: Cell::new(None),
         workers: RefCell::new(Vec::new()),
         capture_cancel: RefCell::new(None),
         settings: RefCell::new(settings),
@@ -143,6 +145,71 @@ fn launcher_retains_activation_when_skip_taskbar_is_enabled() {
         0,
         "Launcher must still accept keyboard focus"
     );
+}
+
+#[test]
+#[ignore = "opens an isolated cold Launcher and sends keyboard input only to its own foreground window"]
+fn cold_launcher_accepts_keyboard_without_a_click_or_second_show() {
+    exercise_launcher_keyboard(false);
+}
+
+#[test]
+#[ignore = "checks a foreground Launcher with no native keyboard focus using only its own HWND"]
+fn foreground_launcher_recovers_missing_keyboard_focus() {
+    exercise_launcher_keyboard(true);
+}
+
+fn exercise_launcher_keyboard(clear_native_focus: bool) {
+    let app = isolated_app();
+    let input = native_input::NativeInput::start(app.events.clone(), "Ctrl+Shift+F9".into(), Vec::new());
+    let pump = slint::Timer::default();
+    let owner = app.clone();
+    pump.start(slint::TimerMode::Repeated, Duration::from_millis(25), move || owner.pump());
+    let result = Rc::new(RefCell::new(None));
+    slint::Timer::single_shot(Duration::from_millis(80), move || {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        let key = |vk, flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+        let inputs = [key(VK_CONTROL, 0), key(VK_SHIFT, 0), key(VK_F9, 0), key(VK_F9, KEYEVENTF_KEYUP), key(VK_SHIFT, KEYEVENTF_KEYUP), key(VK_CONTROL, KEYEVENTF_KEYUP)];
+        unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32); }
+    });
+    let owner = app.clone();
+    let observed = result.clone();
+    let typed = Rc::new(Cell::new(false));
+    let input_timer = slint::Timer::default();
+    input_timer.start(slint::TimerMode::Repeated, Duration::from_millis(20), move || {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        let hwnd = crate::window_by_title("WebTools Launcher Replica");
+        if typed.get() || hwnd == 0 || visual::current_foreground() != hwnd { return; }
+        typed.set(true);
+        if clear_native_focus {
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(std::ptr::null_mut()); }
+            owner.refocus_launcher_after_handoff();
+        }
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::*;
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            GetGUIThreadInfo(GetWindowThreadProcessId(hwnd as _, std::ptr::null_mut()), &mut info);
+            eprintln!("cold-focus: native-focus={:?} launcher={hwnd:x} ctrl={} shift={}", info.hwndFocus, GetAsyncKeyState(VK_CONTROL as i32), GetAsyncKeyState(VK_SHIFT as i32));
+        }
+        let key = |flags| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: 0, wScan: b'x' as u16, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+        let inputs = [key(KEYEVENTF_UNICODE), key(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)];
+        unsafe { SendInput(2, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32); }
+        let owner = owner.clone();
+        let observed = observed.clone();
+        slint::Timer::single_shot(Duration::from_millis(150), move || {
+            let native_focus = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() as isize };
+            *observed.borrow_mut() = Some((visual::current_foreground() == hwnd, native_focus == hwnd, owner.launcher.get_query().to_string()));
+            owner.hide();
+            let _ = slint::quit_event_loop();
+        });
+    });
+    slint::Timer::single_shot(Duration::from_secs(4), || { let _ = slint::quit_event_loop(); });
+    slint::run_event_loop_until_quit().unwrap();
+    input_timer.stop();
+    pump.stop();
+    drop(input);
+    assert_eq!(result.borrow().as_ref(), Some(&(true, true, "x".into())), "cold show must own native keyboard focus and receive input without a mouse click");
 }
 
 #[test]

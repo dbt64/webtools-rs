@@ -1,6 +1,6 @@
 # Plugin Window Theme and UI Contract
 
-Phase 6F-4E supplies optional color semantics to the existing Manifest v3 WebContentsView. It does not provide components or require a plugin to adopt WebTools page styling. No permission, Manifest field, SDK helper, or framework dependency is required.
+Phase 6F-4E supplies optional color semantics to the existing Manifest v3 WebContentsView. P1 adds an optional SDK CSS layer for common page controls; plugins are not required to adopt it. No permission, Manifest field, runtime SDK helper, or framework dependency is required.
 
 ## UI ownership
 
@@ -11,7 +11,7 @@ Phase 6F-4E supplies optional color semantics to the existing Manifest v3 WebCon
 | Independent Plugin Window shell | Host owns title/icon, outer background, size constraints, focus, reuse and close lifecycle. Windows still controls native titlebar decoration. |
 | Plugin content page | The plugin owns HTML/CSS/JS, layout, spacing, typography, controls, icons, navigation and page accessibility. |
 
-A plugin that ignores the variables continues to use its own styles. Its page can differ from the Host and other plugins. Compatibility does not promise visual parity. Host-rendered pages can offer stricter consistency; a mandatory SDK/UI component contract would need a separate design and adoption decision.
+A plugin that ignores the variables continues to use its own styles. Its page can differ from the Host and other plugins. Compatibility does not promise visual parity. Host-rendered pages can offer stricter consistency; the SDK stylesheet below is an opt-in authoring aid, not a mandatory Host component contract.
 
 ## Theme source and timing
 
@@ -72,6 +72,25 @@ Ordinary CSS imports work in every supported framework:
 | React | `import './theme.css'` in the entry that calls `createRoot(...).render(...)`. |
 | Svelte | `import './theme.css'` in the entry that mounts the Svelte component. |
 
+### Optional SDK UI stylesheet
+
+Manifest v3 Web plugins may instead import `@webtools/plugin-sdk/ui.css`. It imports `theme.css`, consumes the same injected color variables, and adds CSS-only classes for:
+
+| Class | Use |
+| --- | --- |
+| `.wt-container`, `.wt-stack`, `.wt-row`, `.wt-card` | Basic page composition and surfaces |
+| `.wt-button`, `.wt-button-primary`, `.wt-button-quiet` | Buttons and actions |
+| `.wt-field`, `.wt-label`, `.wt-input`, `.wt-select`, `.wt-textarea`, `.wt-switch` | Labeled fields and a checkbox switch |
+| `.wt-list`, `.wt-list-item`, `.wt-menu`, `.wt-menu-item` | Lists and menu-like choices |
+| `.wt-tag`, `.wt-icon` | Compact status and inline icons |
+| `.wt-tooltip[data-tooltip]`, `.wt-loading`, `.wt-spinner` | Tooltip and loading presentation |
+| `.wt-empty`, `.wt-error` | Empty and error feedback |
+| `.wt-muted`, `.wt-small`, `.wt-break-words`, `.wt-truncate` | Common text treatments |
+
+The stylesheet defines `--wt-*` aliases from the Host color tokens, a Segoe UI/YaHei font stack, 4/8/12/16/24 px spacing, 6/9/14 px radii, and visible keyboard focus styles. It adds no JavaScript or component runtime. Inline SVG icons inherit `currentColor`; the SDK does not bundle an icon font or impose a particular icon set.
+
+Import it from the Web entry using the normal bundler import in Vue, React, Svelte or Vanilla. The generated starter imports `@webtools/plugin-sdk/ui.css` before `web/src/style.css`, so local rules naturally override the shared defaults. Authors may also omit the import, or import only `theme.css` when they want the color variables without the base rules/classes. CSS pixels scale with the WebContents device scale factor; `rem`, `clamp()` and the narrow-width rules support user zoom and smaller plugin windows.
+
 CSS variable consumers update through the CSS cascade when the Host replaces values. No bridge call or theme-event SDK helper is needed. Public helpers/starter synchronization belong to Phase 6F-5.
 
 The injected value represents the **effective WebTools preference**, including a saved light/dark override. `prefers-color-scheme` and `matchMedia` represent the runtime's system preference and may differ from an explicit WebTools preference. Use the injected variable when following WebTools; use a media query when deliberately following the OS independently. In WebTools `system` mode the variables follow Windows automatically.
@@ -84,7 +103,7 @@ Authors remain responsible for semantic controls, labels, tab order, visible foc
 
 The inherited palette's text/surface contrast is 15.31:1 (light) and 16.00:1 (dark); muted/surface is 5.16:1 and 6.86:1. The accent-foreground/accent pair is **4.19:1 in light mode** and 8.77:1 in dark mode. The light accent pair does not meet 4.5:1 for normal-size text: use it for large text/non-text accents, or choose an author-controlled accessible pairing. Theme tokens alone do not imply WCAG compliance. Values use the approved existing palette; this phase does not redesign Manager colors.
 
-No Host UI kit, required style library, plugin migration, arbitrary CSS input, theme capability/permission, or plugin access to global settings is introduced. Existing declarative pages keep their Host renderer; this CSS contract targets independent Manifest v3 Window Features.
+No mandatory Host UI kit, required style library, plugin migration, arbitrary CSS input, theme capability/permission, or plugin access to global settings is introduced. The optional SDK CSS does not alter installed pages unless they import it. Existing declarative pages keep their Host renderer; this CSS contract targets independent Manifest v3 Window Features.
 
 ## uTools reference boundary
 

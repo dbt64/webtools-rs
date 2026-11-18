@@ -37,7 +37,7 @@ export function catalogFeatureSummary(entry: CatalogEntryDTO): string {
   if (entry.kind === 'builtin') return '内置翻译窗口'
   if (entry.kind === 'declarative') return '兼容插件页面'
   const count = entry.package.webFeatures?.length
-  return count ? `${count} 项功能` : '功能信息暂不可读取'
+  return count ? `${count} 项功能` : entry.package.mcpToolCount ? `${entry.package.mcpToolCount} 个 MCP 工具` : '功能信息暂不可读取'
 }
 
 /** Converts safe Host metadata into product labels; never grants execution in Renderer. */
@@ -67,7 +67,7 @@ export function catalogFeatureRows(entry: CatalogEntryDTO): CatalogFeatureRow[] 
       }
       if (rule.type === 'directories') contexts.add(`选中的文件夹 / 当前资源管理器文件夹${rule.maxItems ? `，最多 ${rule.maxItems} 项` : ''}`)
     }
-    const labels = { manager: '插件管理', launcher: '搜索框', 'super-panel': '超级面板' }
+    const labels = { manager: '插件管理', launcher: '搜索框', 'super-panel': '超级面板', hotkey: '快捷键' }
     const command = feature.presentation?.type === 'command'
     return {
       key: feature.id, title: feature.title, description: feature.description ?? '',

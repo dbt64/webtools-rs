@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { PluginDevelopmentStatus } from '../../shared/plugin-development-contracts.ts'
+import { createDevelopmentSimulation, type DevelopmentSimulationMode } from './development-simulation.ts'
 
 const status = ref<PluginDevelopmentStatus>({ enabled: false, connected: false, diagnostics: [] })
 const busy = ref(false)
 const feedback = ref('')
+const simulationMode = ref<DevelopmentSimulationMode>('manager')
+const simulationInput = ref('')
+const pathsMode = computed(() => simulationMode.value === 'files' || simulationMode.value === 'directories')
 let removeListener: (() => void) | undefined
 let disposed = false
 
@@ -13,6 +17,7 @@ async function load(): Promise<void> {
   if (!disposed && result.ok) status.value = result.data
 }
 async function perform(action: () => Promise<{ ok: boolean; error?: { message: string } }>): Promise<void> {
+  if (busy.value) return
   busy.value = true; feedback.value = ''
   try {
     const result = await action()
@@ -27,7 +32,14 @@ function toggle(event: Event): void {
 }
 function connectProject(): void { void perform(() => window.desktop.pluginDevelopment.connectFromDialog()) }
 function disconnectProject(): void { void perform(() => window.desktop.pluginDevelopment.disconnect()) }
-function openFeature(featureId: string): void { void perform(() => window.desktop.pluginDevelopment.openFeature(featureId)) }
+function reconnectProject(): void { void perform(() => window.desktop.pluginDevelopment.reconnect()) }
+function openFeature(featureId: string): void {
+  if (busy.value || !status.value.connected) return
+  try {
+    const invocation = createDevelopmentSimulation(simulationMode.value, simulationInput.value)
+    void perform(() => window.desktop.pluginDevelopment.openFeature(featureId, invocation))
+  } catch (error) { feedback.value = error instanceof Error ? error.message : '模拟输入无效。' }
+}
 async function copy(pluginId: string, featureId?: string): Promise<void> {
   await perform(() => window.desktop.pluginDevelopment.copyDiagnostics(pluginId, featureId))
   if (!disposed && !feedback.value) feedback.value = '诊断已复制。'
@@ -46,11 +58,28 @@ onBeforeUnmount(() => { disposed = true; removeListener?.() })
       <p class="developer-help">在外部项目运行 pnpm dev，然后连接项目。成功构建会重建正在运行的 Feature；开发数据与已安装插件隔离。</p>
       <div class="developer-actions">
         <button type="button" class="secondary-button" :disabled="busy" @click="connectProject">{{ status.project ? '连接其他开发项目…' : '连接开发项目…' }}</button>
+        <button v-if="status.reconnectAvailable && !status.connected" type="button" class="secondary-button" :disabled="busy" @click="reconnectProject">重新连接上次项目</button>
         <button v-if="status.project" type="button" class="secondary-button" :disabled="busy" @click="disconnectProject">断开</button>
       </div>
       <div v-if="status.project" class="developer-project">
         <strong>{{ status.project.name }}</strong><code>{{ status.project.pluginId }}</code>
         <small>{{ status.project.projectName }} · {{ status.connected ? `已连接 · 构建 ${status.project.revision}` : '已断开，请重新连接' }}</small>
+        <fieldset class="simulation-fields" :disabled="busy || !status.connected">
+          <legend>入口与上下文模拟</legend>
+          <label for="development-simulation-mode">模拟入口</label>
+          <select id="development-simulation-mode" v-model="simulationMode">
+            <option value="manager">Manager · 无上下文</option>
+            <option value="launcher">Launcher · 输入文字</option>
+            <option value="text">Super Panel · 选中文字</option>
+            <option value="files">Super Panel · 选中文件</option>
+            <option value="directories">Super Panel · 选中目录</option>
+          </select>
+          <template v-if="simulationMode !== 'manager'">
+            <label for="development-simulation-input">{{ pathsMode ? '模拟路径（每行一个，最多 64 项）' : '模拟文字' }}</label>
+            <textarea id="development-simulation-input" v-model="simulationInput" rows="3" :placeholder="pathsMode ? 'C:\\example\\file.txt' : '输入需要传给插件的文字'" :maxlength="pathsMode ? 65536 : simulationMode === 'launcher' ? 300 : 32768" spellcheck="false" />
+          </template>
+          <p class="developer-help">填写模拟数据后，点击下方功能打开。不会读取真实剪贴板或当前选区；模拟调用仍受 Feature 接受的上下文类型与能力权限校验。</p>
+        </fieldset>
         <div class="developer-actions"><button v-for="feature in status.project.features" :key="feature.id" class="secondary-button" type="button" :disabled="busy || !status.connected || feature.available === false" @click="openFeature(feature.id)">{{ feature.title }}</button></div>
       </div>
       <article v-for="diagnostic in status.diagnostics" :key="`${diagnostic.pluginId}:${diagnostic.featureId ?? ''}`" class="developer-diagnostic">
@@ -72,6 +101,11 @@ onBeforeUnmount(() => { disposed = true; removeListener?.() })
 .developer-toggle small, .developer-help, .developer-project small, .developer-diagnostic small { color: var(--muted); font-size: 10px; line-height: 1.6; }
 .developer-project { display: grid; gap: 8px; margin-top: 12px; }
 .developer-project code { overflow-wrap: anywhere; font-size: 11px; }
+.simulation-fields { display: grid; gap: 7px; min-width: 0; padding: 12px; margin: 3px 0; border: 1px solid var(--line); border-radius: 6px; }
+.simulation-fields legend, .simulation-fields label { font-size: 11px; }
+.simulation-fields select, .simulation-fields textarea { width: 100%; min-width: 0; padding: 8px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 5px; font: inherit; font-size: 11px; }
+.simulation-fields textarea { resize: vertical; }
+.simulation-fields .developer-help { margin: 0; }
 .developer-diagnostic { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
 .diagnostic-heading { justify-content: space-between; }
 dl { display: grid; gap: 6px; font-size: 11px; } dl > div { display: flex; flex-wrap: wrap; gap: 10px; } dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }

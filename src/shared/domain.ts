@@ -54,6 +54,7 @@ export interface EverythingResult { id: string; name: string; locationLabel: str
 export interface TranslationPrefillRequest { id: string; text: string }
 export interface AppSearchMemoryEntry { appId: string; lastUsedAt: number }
 export type AppSearchMemory = Record<string, AppSearchMemoryEntry>
+export interface PluginFeatureShortcut { pluginId: string; featureId: string; shortcut: string; autoCopy?: boolean }
 
 export type ThemePreference = 'light' | 'dark' | 'system'
 export type LauncherDisplayMode = 'compact' | 'expanded'
@@ -66,6 +67,7 @@ export interface AppSettings {
   websiteLayout: 'grid' | 'list'
   everythingEnabled: boolean
   everythingEsPath: string
+  pluginFeatureShortcuts: PluginFeatureShortcut[]
   aiBaseUrl: string
   aiModel: string
   sharedAI: SharedAISettings
@@ -104,6 +106,7 @@ export const DEFAULT_APP_DATA: AppData = {
     websiteLayout: 'grid',
     everythingEnabled: false,
     everythingEsPath: '',
+    pluginFeatureShortcuts: [],
     aiBaseUrl: '',
     aiModel: '',
     sharedAI: createDefaultSharedAISettings(),

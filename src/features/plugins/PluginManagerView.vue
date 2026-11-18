@@ -3,7 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, ExternalLink, Languages, LayoutGrid, PackagePlus, Puzzle, RefreshCw, Search, ShieldCheck } from '@lucide/vue'
 import type { InstalledPluginCapability as PluginCapability, PluginSummary } from '../../shared/plugin-contracts.ts'
 import type { BuiltinEntryDTO, CatalogEntryDTO, PluginRef } from '../../shared/plugin-catalog-contracts.ts'
-import { catalogFeatureRows, catalogFeatureSummary, catalogKey, catalogRef, catalogPresentation } from './catalog-view-model.ts'
+import type { PluginFeatureShortcut } from '../../shared/domain.ts'
+import { catalogFeatureRows, catalogFeatureSummary, catalogKey, catalogRef, catalogPresentation, type CatalogFeatureRow } from './catalog-view-model.ts'
 import { pluginCanOpen, pluginGrantPayload, pluginInstallFeedback, pluginManagementError, pluginPermissionRows, pluginStatusView } from './plugin-view-model.ts'
 import PluginDevelopmentPanel from './PluginDevelopmentPanel.vue'
 import PluginConfigurationEditor from './PluginConfigurationEditor.vue'
@@ -26,6 +27,9 @@ const configurationBusy = ref(false)
 const configurationDirty = ref(false)
 const configurationEditor = ref<{ confirmLeave(): boolean } | null>(null)
 const feedback = ref<{ kind: 'status' | 'error'; text: string } | null>(null)
+const pluginFeatureShortcuts = ref<PluginFeatureShortcut[]>([])
+const shortcutCaptureFeature = ref<string | null>(null)
+let shortcutCaptureListener: ((event: KeyboardEvent) => void) | null = null
 const developerExpanded = ref(false)
 const managementMenuOpen = ref(false)
 const actionRoot = ref<HTMLElement | null>(null)
@@ -80,7 +84,7 @@ const primaryActionLabel = computed(() => {
   if (selectedBuiltin.value?.state.status === 'stopping') return '正在停用…'
   return ({
     open: '打开', run: '运行', enable: '启用', retry: '重试', recover: '备份并恢复状态',
-    permissions: '查看权限', health: '查看状态', unavailable: selected.value ? '暂不可用' : '选择插件',
+    permissions: '查看权限', health: '查看状态', unavailable: selectedPackage.value?.mcpToolCount ? 'MCP 工具插件' : selected.value ? '暂不可用' : '选择插件',
   }[primaryAction.value])
 })
 const primaryActionDisabled = computed(() => operationsDisabled.value || primaryAction.value === 'unavailable')
@@ -161,6 +165,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleOutsidePointer, true)
   window.removeEventListener('blur', handleWindowBlur)
+  stopShortcutCapture()
 })
 watch(managementActions, () => closeManagementMenu())
 watch(operationsDisabled, disabled => { if (disabled) closeManagementMenu() })
@@ -170,10 +175,99 @@ watch(() => props.selection, value => {
 }, { immediate: true })
 
 watch(selected, plugin => {
+  stopShortcutCapture()
   grantedDraft.value = plugin && plugin.kind !== 'builtin' ? plugin.package.granted.filter(cap => cap !== 'network.domains') : []
+  void loadPluginFeatureShortcuts()
 }, { immediate: true })
 
 function errorText(error: { code: string; message: string }): string { return pluginManagementError(error) }
+
+async function loadPluginFeatureShortcuts(): Promise<void> {
+  try { pluginFeatureShortcuts.value = (await window.desktop.getSettings()).pluginFeatureShortcuts ?? [] }
+  catch { pluginFeatureShortcuts.value = [] }
+}
+
+function featureShortcut(feature: CatalogFeatureRow): string | null {
+  const plugin = selected.value
+  if (plugin?.kind !== 'web') return null
+  return pluginFeatureShortcuts.value.find(item => item.pluginId === plugin.id && item.featureId === feature.key)?.shortcut ?? null
+}
+
+function featureAutoCopy(feature: CatalogFeatureRow): boolean {
+  return pluginFeatureShortcuts.value.find(item => item.pluginId === selected.value?.id && item.featureId === feature.key)?.autoCopy === true
+}
+
+function stopShortcutCapture(): void {
+  if (shortcutCaptureListener) window.removeEventListener('keydown', shortcutCaptureListener, true)
+  shortcutCaptureListener = null
+  shortcutCaptureFeature.value = null
+}
+
+function shortcutKeyName(event: KeyboardEvent): string | null {
+  if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3)
+  if (/^Digit[0-9]$/.test(event.code)) return event.code.slice(5)
+  if (/^F(?:[1-9]|1[0-2])$/.test(event.code)) return event.code
+  return ({ Space: 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+    PageUp: 'PageUp', PageDown: 'PageDown', Home: 'Home', End: 'End', Insert: 'Insert', Delete: 'Delete',
+    Backspace: 'Backspace', Tab: 'Tab', Enter: 'Enter' } as Record<string, string>)[event.code] ?? null
+}
+
+function shortcutIdentity(shortcut: string): string {
+  return shortcut.toLowerCase().split('+').map(part => {
+    const key = part.trim()
+    return ({ control: 'ctrl', meta: 'win', super: 'win', arrowup: 'up', arrowdown: 'down', arrowleft: 'left', arrowright: 'right' } as Record<string, string>)[key] ?? key
+  }).sort().join('+')
+}
+
+function beginShortcutCapture(feature: CatalogFeatureRow): void {
+  stopShortcutCapture()
+  const plugin = selected.value
+  if (plugin?.kind !== 'web' || feature.ref.kind !== 'web') return
+  const captureKey = `${plugin.id}:${feature.key}`
+  shortcutCaptureFeature.value = captureKey
+  const listener = (event: KeyboardEvent) => {
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    if (event.key === 'Escape') { stopShortcutCapture(); return }
+    if (['Control', 'Alt', 'Shift', 'Meta'].includes(event.key)) return
+    const key = shortcutKeyName(event)
+    if (!key) return
+    const parts = [event.ctrlKey ? 'Ctrl' : '', event.altKey ? 'Alt' : '', event.shiftKey ? 'Shift' : '', event.metaKey ? 'Win' : '', key].filter(Boolean)
+    if (parts.length === 1) return
+    stopShortcutCapture()
+    void saveFeatureShortcut(feature, parts.join('+'))
+  }
+  shortcutCaptureListener = listener
+  window.addEventListener('keydown', listener, true)
+}
+
+async function saveFeatureShortcut(feature: CatalogFeatureRow, shortcut: string | null, autoCopy?: boolean): Promise<void> {
+  const plugin = selected.value
+  if (plugin?.kind !== 'web' || feature.ref.kind !== 'web') return
+  const featureId = feature.key
+  try {
+    const current = await window.desktop.getSettings()
+    const next = (current.pluginFeatureShortcuts ?? []).filter(item => item.pluginId !== plugin.id || item.featureId !== featureId)
+    if (shortcut) {
+      const identity = shortcutIdentity(shortcut)
+      if (shortcutIdentity(current.quickSearchShortcut) === identity) {
+        feedback.value = { kind: 'error', text: '该快捷键已用于唤出搜索框，请选择其他组合键。' }
+        return
+      }
+      if (next.some(item => shortcutIdentity(item.shortcut) === identity)) {
+        feedback.value = { kind: 'error', text: '该快捷键已分配给其他插件功能，请选择其他组合键。' }
+        return
+      }
+    }
+    if (shortcut) next.push({ pluginId: plugin.id, featureId, shortcut, autoCopy: autoCopy ?? featureAutoCopy(feature) })
+    const result = await window.desktop.updateSettings({ pluginFeatureShortcuts: next })
+    if (!result.ok) { feedback.value = { kind: 'error', text: errorText(result.error) }; return }
+    pluginFeatureShortcuts.value = result.data.pluginFeatureShortcuts
+    feedback.value = { kind: 'status', text: shortcut ? `已为“${feature.title}”设置 ${shortcut}。` : `已清除“${feature.title}”的快捷键。` }
+  } catch (error) {
+    feedback.value = { kind: 'error', text: error instanceof Error ? error.message : '快捷键未能保存。' }
+  }
+}
 
 async function perform(key: string, operation: () => Promise<void>): Promise<void> {
   if (operationsDisabled.value) return
@@ -379,6 +473,7 @@ function runManagementAction(action: ManagementAction): void {
         </div>
       </header>
 
+      <p v-if="selectedPackage?.mcpToolCount" class="plugin-section-description">此插件提供 {{ selectedPackage.mcpToolCount }} 个 MCP 工具，请到设置 → AI 设置 → MCP 服务查看和连接。</p>
       <section class="plugin-detail-section" aria-labelledby="plugin-features-title">
         <h2 id="plugin-features-title">功能</h2>
         <p class="plugin-section-description">查看可用入口和适用内容。每次调用仍由 WebTools 检查权限与当前状态。</p>
@@ -388,6 +483,18 @@ function runManagementAction(action: ManagementAction): void {
             <button v-if="features.length > 1 && selectedEnabled && primaryFeature?.key !== feature.key" type="button" class="secondary-button" :disabled="operationsDisabled || !feature.available" @click="emit('openPlugin', feature.ref)">{{ feature.openLabel }}</button>
           </div>
           <dl class="plugin-feature-facts"><div><dt>使用入口</dt><dd>{{ feature.surfaces.join('、') }}</dd></div><div><dt>适用内容</dt><dd>{{ feature.contexts.join('；') }}</dd></div><div><dt>操作方式</dt><dd>{{ feature.action }}</dd></div></dl>
+          <div v-if="selected?.kind === 'web'" class="plugin-feature-shortcut">
+            <div class="plugin-feature-shortcut-copy">
+              <strong>功能快捷键</strong>
+              <span>设置后可在 WebTools 后台运行时直接打开此功能。</span>
+              <kbd>{{ shortcutCaptureFeature === `${selected.id}:${feature.key}` ? '按下组合键…（Esc 取消）' : featureShortcut(feature) ?? '未设置' }}</kbd>
+            </div>
+            <div class="plugin-feature-shortcut-actions">
+              <button type="button" class="secondary-button" :disabled="operationsDisabled" @click="beginShortcutCapture(feature)">{{ featureShortcut(feature) ? '重新录入' : '设置快捷键' }}</button>
+              <button v-if="featureShortcut(feature)" type="button" class="secondary-button" :disabled="operationsDisabled" @click="saveFeatureShortcut(feature, null)">清除</button>
+            </div>
+            <label v-if="featureShortcut(feature)"><input type="checkbox" :checked="featureAutoCopy(feature)" @change="saveFeatureShortcut(feature, featureShortcut(feature), ($event.target as HTMLInputElement).checked)"> 使用当前选中内容（文字会通过复制获取）</label>
+          </div>
           <p v-if="!feature.available" class="plugin-section-description">当前不可调用，请查看启用状态、权限和运行状态。</p>
         </article>
         <p v-if="features.length === 0" class="plugin-section-description">当前无法读取功能说明。可以重新加载状态或重新导入原始插件包。</p>
@@ -521,6 +628,12 @@ function runManagementAction(action: ManagementAction): void {
 .plugin-feature-facts > div { display: grid; grid-template-columns: 60px minmax(0, 1fr); gap: 10px; }
 .plugin-feature-facts dt { color: var(--muted); }
 .plugin-feature-facts dd { margin: 0; overflow-wrap: anywhere; }
+.plugin-feature-shortcut { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.plugin-feature-shortcut-copy { display: grid; min-width: 0; gap: 4px; }
+.plugin-feature-shortcut-copy strong { font-size: 11px; font-weight: 600; }
+.plugin-feature-shortcut-copy span { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.plugin-feature-shortcut-copy kbd { width: fit-content; padding: 3px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--text); background: var(--surface-raised); font-family: inherit; font-size: 10px; }
+.plugin-feature-shortcut-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 6px; }
 .plugin-permission-list { display: grid; gap: 2px; padding: 0; margin: 0 0 12px; border: 0; }
 .plugin-permission-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; gap: 8px; padding: 10px 0; color: var(--text); }
 .plugin-permission-row input { accent-color: var(--accent); margin-top: 2px; }

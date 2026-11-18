@@ -9,8 +9,10 @@ import type { PluginRuntimeDiagnostics } from './plugin-runtime-diagnostics.ts'
 import { nextRuntimeGeneration } from './runtime-generation.ts'
 import { hasExactResultFields, parseFeatureTextResult, type FeatureTextResult } from '../../src/shared/feature-quick-result-contracts.ts'
 
-export type NodeCommandOutcome = { readonly status: 'completed'; readonly result?: FeatureTextResult; readonly externalOpened?: true } | { readonly status: 'cancelled' }
+export type NodeCommandOutcome = { readonly status: 'completed'; readonly result?: FeatureTextResult; readonly externalOpened?: true; readonly mcpResult?: Record<string, unknown> } | { readonly status: 'cancelled' }
 export interface NodeCommandOptions {
+  readonly mcpInput?: Readonly<Record<string, unknown>>
+  readonly task?: import('../../plugin-sdk/declarative-v1/web/protocol.mjs').ScheduledTrigger
   readonly resultTarget?: 'super-panel'
   readonly signal?: AbortSignal
   readonly effects?: Partial<Omit<WebCapabilityEffects, 'hasForegroundGesture'>>
@@ -41,7 +43,7 @@ export class NodeCommandExecutionAdapter {
     if (manifest.manifestVersion !== 3 || manifest.runtime.kind !== 'node') throw executionError('UNSUPPORTED_FEATURE_KIND', 'No supported Node command runtime.')
     const feature = manifest.features.find(item => item.id === authority.featureId)
     if (feature?.entry.kind !== 'node-command'
-      || feature.presentation?.type !== 'command') throw executionError('UNSUPPORTED_FEATURE_KIND', 'No supported Node command entry.')
+      || feature.presentation?.type !== 'command' || Boolean(feature.mcpTool) !== (options.mcpInput !== undefined)) throw executionError('UNSUPPORTED_FEATURE_KIND', 'No supported Node command entry.')
     if (this.closed || !authority.isCurrent()) throw executionError('FEATURE_UNAVAILABLE', 'Command authority unavailable.')
     if (this.active.size >= 8) throw executionError('QUEUE_FULL', 'Too many active commands.')
     const abort = new AbortController()
@@ -70,7 +72,7 @@ export class NodeCommandExecutionAdapter {
     let externalOpened = false
     try {
       const dependencies = this.deps.capabilities(authority)
-      let gesture = true
+      let gesture = !options.task && options.mcpInput === undefined
       capabilities = new WebHostCapabilities({ authority, store: dependencies.store,
         context: context ? { ...context, ageMs: context.ageMs + Date.now() - receivedAt } : undefined,
         requireExternalConfirmation: false,
@@ -106,6 +108,8 @@ export class NodeCommandExecutionAdapter {
           if (abort.signal.aborted) { cancel(); return }
           try {
             child!.postMessage({ type: 'start', descriptor: { ...descriptor, generation },
+              ...(options.task ? { task: options.task } : {}),
+              ...(options.mcpInput !== undefined ? { mcpInput: options.mcpInput } : {}),
               ...(options.resultTarget ? { resultTarget: options.resultTarget } : {}),
               capabilities: ['sharedAI.complete', 'clipboard.write', 'external.open'].filter(cap => authority.isCurrent(cap as 'sharedAI.complete' | 'clipboard.write' | 'external.open')) })
           } catch { reject(executionError('COMMAND_START_FAILED', 'Command execution could not start.')) }
@@ -117,6 +121,13 @@ export class NodeCommandExecutionAdapter {
           if (terminalReceived) { terminalError = executionError('COMMAND_PROTOCOL_ERROR', 'Duplicate command completion.'); reject(terminalError); return }
           if (value.type === 'completed') {
             terminalReceived = true
+            if (options.mcpInput !== undefined) {
+              const output = value.mcpResult
+              if (!hasExactResultFields(value, ['type', 'mcpResult']) || !output || typeof output !== 'object' || Array.isArray(output)) {
+                terminalError = executionError('COMMAND_PROTOCOL_ERROR', 'Invalid MCP tool result.'); reject(terminalError); return
+              }
+              resolve({ status: 'completed', mcpResult: output as Record<string, unknown> }); return
+            }
             const output = Object.hasOwn(value, 'result') ? parseFeatureTextResult(value.result) : undefined
             if (!hasExactResultFields(value, output === undefined ? ['type'] : ['type', 'result']) || output === null) {
               terminalError = executionError('COMMAND_PROTOCOL_ERROR', 'Invalid command result.'); reject(terminalError); return

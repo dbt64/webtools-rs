@@ -12,6 +12,7 @@ export function overlayNativeLauncherSettings(base: AppSettings, nativeState: Na
     defaultSearchEngineId: nativeState.defaultSearchEngineId,
     everythingEnabled: nativeState.everythingEnabled,
     everythingEsPath: nativeState.everythingEsPath,
+    pluginFeatureShortcuts: structuredClone(nativeState.pluginFeatureShortcuts),
   }
 }
 

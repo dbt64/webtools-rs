@@ -10,6 +10,41 @@ import { parseManifest, LIMITS } from './manifest.ts'
 import { manifest } from './fixtures.mjs'
 async function setup(t) { const root = await mkdtemp(join(tmpdir(), 'webtools-plugin-store-')); t.after(() => rm(root, { recursive: true, force: true })); const fs = new ManagedFs(join(root, 'plugins')); await fs.initialize(); return { root, fs, store: new PluginStore(fs), registry: new PluginRegistry(fs) } }
 const parsed = overrides => parseManifest(Buffer.from(JSON.stringify(manifest(overrides))), '0.1.0')
+test('repeated file replacement and backup restore use the latest stored bytes', async t => {
+  const { store } = await setup(t); const id = 'org.example.replace'; const path = 'attachments/test.json'
+  const encode = value => Buffer.from(value).toString('base64')
+  const read = async () => Buffer.from(await store.readFile(id, path), 'base64').toString()
+  await store.writeFile(id, path, encode('{"name":"小明"}'), () => true)
+  const backup = await store.exportBackup(id)
+  await store.writeFile(id, path, encode('{"name":"小红"}'), () => true)
+  assert.equal(await read(), '{"name":"小红"}')
+  await store.importBackup(id, backup, () => true)
+  assert.equal(await read(), '{"name":"小明"}')
+  await store.writeFile(id, path, encode('{"name":"小刚"}'), () => true)
+  assert.equal(await read(), '{"name":"小刚"}')
+  assert.equal(Buffer.from((await store.exportBackup(id)).files[0].data, 'base64').toString(), '{"name":"小刚"}')
+})
+test('failed backup import restores the previous data and file tree', async t => {
+  const { store } = await setup(t); const id = 'org.example.rollback'
+  const encode = value => Buffer.from(value).toString('base64')
+  await store.writeData(id, 'name', 'original', () => true)
+  await store.writeFile(id, 'attachments/old.txt', encode('old file'), () => true)
+  const backup = {
+    format: 'webtools-plugin-storage', version: 1, pluginId: id, exportedAt: new Date().toISOString(),
+    data: { name: 'replacement' },
+    files: [
+      { path: 'attachments/new-a.txt', data: encode('new a') },
+      { path: 'attachments/new-b.txt', data: encode('new b') },
+    ],
+  }
+  let commits = 0
+  await assert.rejects(() => store.importBackup(id, backup, () => ++commits < 5), error => error.code === 'SESSION_EXPIRED')
+
+  assert.equal(await store.readData(id, 'name'), 'original')
+  assert.equal(Buffer.from(await store.readFile(id, 'attachments/old.txt'), 'base64').toString(), 'old file')
+  assert.equal(await store.readFile(id, 'attachments/new-a.txt'), null)
+  assert.equal(await store.readFile(id, 'attachments/new-b.txt'), null)
+})
 test('full storage envelope depth is checked before replacement', async t => {
   const { store } = await setup(t); const id = 'org.example.depth'
   await store.writeData(id, 'keep', 'original', () => true)

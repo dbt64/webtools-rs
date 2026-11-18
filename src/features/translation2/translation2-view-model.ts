@@ -39,6 +39,10 @@ export interface Translation2ViewState {
   request: { id: string; contentGeneration: number } | null
 }
 
+export function translation2ResultKey(text: string, source: string, target: string, service: string): string {
+  return JSON.stringify([text, source, target, service])
+}
+
 export function buildTranslation2Tabs(
   settings: Translation2WorkspaceSettings,
   descriptors: readonly Translation2WebsiteProviderDescriptor[],

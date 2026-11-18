@@ -56,6 +56,7 @@ fn manager_surfaces_release_ownership_and_exit() {
             ..Default::default()
         },
         runtime: RefCell::new(None),
+        mcp_server: RefCell::new(None),
         ownership: webtools_ipc::HostOwnership::default(),
         active_session: RefCell::new(None),
         pending_handoff: RefCell::new(None),
@@ -65,7 +66,8 @@ fn manager_surfaces_release_ownership_and_exit() {
         host_events: RefCell::new(None),
         events,
         receiver,
-        external: Cell::new(0),
+        external: Cell::new(crate::paste_target::PasteTarget::default()),
+        pending_launcher_origin: Cell::new(None),
         workers: RefCell::new(vec![]),
         capture_cancel: RefCell::new(None),
         settings: RefCell::new(webtools_ipc::state::default_launcher_state()),

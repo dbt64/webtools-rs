@@ -35,6 +35,8 @@ pub struct AcceptedContext {
     pub kind: ContextKind,
     pub sources: Vec<String>,
     pub extensions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<usize>,
     pub max_items: Option<usize>,
     pub text_match: Option<String>,
 }
@@ -224,6 +226,10 @@ fn parse_context(value: &Value) -> Option<AcceptedContext> {
         Some(Value::Null) | None => None,
         Some(raw) => Some(raw.as_u64()? as usize),
     };
+    let min_items = match value.get("minItems") {
+        Some(Value::Null) | None => None,
+        Some(raw) => Some(raw.as_u64()? as usize),
+    };
     let text_match = value
         .get("textMatch")
         .and_then(Value::as_str)
@@ -232,6 +238,7 @@ fn parse_context(value: &Value) -> Option<AcceptedContext> {
         kind,
         sources,
         extensions,
+        min_items,
         max_items,
         text_match,
     })
@@ -281,6 +288,9 @@ pub fn matches_selection(row: &FeatureRow, selection: &Selection) -> bool {
                     .sources
                     .iter()
                     .any(|source| *source == selection.source)
+                && rule
+                    .min_items
+                    .is_none_or(|limit| selection.items.len() >= limit)
                 && rule
                     .max_items
                     .is_none_or(|limit| selection.items.len() <= limit)
@@ -420,6 +430,15 @@ mod tests {
         assert!(!matches_selection(&files, &three));
         let wrong_ext = Selection::items(vec![(ContextKind::Files, "C:\\a.png".into())]);
         assert!(!matches_selection(&files, &wrong_ext));
+    }
+
+    #[test]
+    fn files_feature_respects_minimum_selection_count() {
+        let feature = row("compare", json!([{ "type": "files", "sources": ["explorer-selection"], "minItems": 2, "maxItems": 3 }]));
+        let selection = |count: usize| Selection::items((0..count).map(|n| (ContextKind::Files, format!("C:\\{n}.png"))).collect());
+        assert!(!matches_selection(&feature, &selection(1)));
+        assert!(matches_selection(&feature, &selection(2)));
+        assert!(!matches_selection(&feature, &selection(4)));
     }
 
     #[test]

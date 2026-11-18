@@ -305,7 +305,11 @@ Section "Install WebTools NativeHost and Manager" SEC_INSTALL
 !endif
   ${Else}
     ${If} $WasAutoStartEnabled == "1"
+!ifdef WEBTOOLS_RUST_HOST_PREVIEW
+      WriteRegStr HKCU "${RUN_KEY}" "WebTools" '"$INSTDIR\WebTools.NativeHost.exe" --startup'
+!else
       WriteRegStr HKCU "${RUN_KEY}" "WebTools" '"$INSTDIR\WebTools.NativeHost.exe"'
+!endif
     ${Else}
       DeleteRegValue HKCU "${RUN_KEY}" "WebTools"
     ${EndIf}

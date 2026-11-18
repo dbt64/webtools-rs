@@ -49,7 +49,7 @@ Support is negotiated on the existing authenticated pipe with the exact optional
 
 ### Real optional browser actions
 
-The [Selected Text Actions example](../examples/plugins/selected-text-actions/README.md), ID `org.webtools.selected-text-actions`, version 1.0.0, contains two real Node Commands:
+The [Selected Text Actions example](https://github.com/dbt64/webtools-plugin/tree/main/examples/plugins/selected-text-actions), ID `org.webtools.selected-text-actions`, version 1.0.0, contains two real Node Commands:
 
 | Action | Eligibility | Effect after explicit activation |
 |---|---|---|

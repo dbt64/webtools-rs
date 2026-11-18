@@ -15,7 +15,7 @@ The first Phase 6A audit found version drift: Manager/package was `0.1.0`; Nativ
 | WebTools Product Version | `0.1.0`, root `package.json` | Version of the installed product and Manager/NativeHost/UpdateHelper/installer. |
 | Plugin API major | `1`, published SDK constants, host runtime and registry checks | Compatibility boundary for host capabilities. It changes only for a breaking plugin API contract. |
 | Plugin Manifest version | `1` for legacy declarative packages; `3` for current Web/Node packages | Package schema revision selected per archive. Manifest v3 is validated by the Host and supported by Plugin Runtime 2.0; the older v2 Web migration requires repacking. |
-| Plugin SDK version | `1.8.0`, `plugin-sdk/declarative-v1/package.json` | Authoring/validator SDK package SemVer, independently versioned and distributed through the documented local `.tgz` workflow. |
+| Plugin SDK version | `1.9.0`, `plugin-sdk/declarative-v1/package.json` | Authoring/validator SDK package SemVer, independently versioned and distributed through the documented local `.tgz` workflow. |
 
 Product releases do not implicitly change Plugin API or Manifest versions. The current Host supports declarative v1 and Runtime 2.0 v3 packages; SDK preflight is advisory and the Host remains install-time authority. Unsupported API majors/manifest versions are rejected before execution. `minHostVersion` is compared with the installed product version. The creator is independently versioned at `1.1.0`. See the [current checkpoint](2026-10-21-platform-consolidation.md) for the accumulated runtime, SDK and lifecycle changes; the original Phase 6A observations below remain historical.
 

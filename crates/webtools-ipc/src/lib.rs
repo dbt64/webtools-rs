@@ -10,6 +10,8 @@
 //! so all three sides agree byte for byte.
 
 pub mod contract;
+pub mod mcp;
+pub mod mcp_store;
 pub mod host;
 pub mod hotkey;
 pub mod pipe;
@@ -18,6 +20,7 @@ pub mod projection;
 pub mod projection_cache;
 pub mod quick_result;
 pub mod server;
+pub mod scheduled_tasks;
 pub mod session;
 pub mod settings;
 pub mod state;

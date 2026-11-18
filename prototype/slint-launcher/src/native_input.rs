@@ -47,6 +47,9 @@ fn send(event: AppEvent) {
         }
     }
 }
+fn should_dismiss_panel(capturing: bool, panel_visible: bool, inside: bool) -> bool {
+    (capturing || panel_visible) && !inside
+}
 unsafe extern "system" fn keyboard(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0
         && matches!(
@@ -101,21 +104,20 @@ unsafe extern "system" fn mouse(code: i32, wparam: usize, lparam: isize) -> isiz
     let mut disposition = Disposition::Pass;
     if down {
         let selected = POINTER.with(|p| p.borrow().gesture.settings.mouse_button);
-        if CAPTURING.load(Ordering::SeqCst) {
+        let panel = PANEL.load(Ordering::SeqCst);
+        let mut rect = std::mem::zeroed();
+        let panel_visible = panel != 0 && IsWindowVisible(panel as _) != 0 && GetWindowRect(panel as _, &mut rect) != 0;
+        let inside = panel_visible && pointer.pt.x >= rect.left && pointer.pt.x < rect.right
+            && pointer.pt.y >= rect.top && pointer.pt.y < rect.bottom;
+        let capturing = CAPTURING.load(Ordering::SeqCst);
+        if capturing && should_dismiss_panel(capturing, panel_visible, inside) {
             observe_capture(false);
             send(AppEvent::Dismiss);
             if button == Some(selected) {
                 disposition = Disposition::Cancel;
             }
         }
-        let panel = PANEL.load(Ordering::SeqCst);
-        let mut rect = std::mem::zeroed();
-        if panel != 0
-            && GetWindowRect(panel as _, &mut rect) != 0
-            && (pointer.pt.x < rect.left
-                || pointer.pt.x >= rect.right
-                || pointer.pt.y < rect.top
-                || pointer.pt.y >= rect.bottom)
+        if panel_visible && !inside
         {
             send(AppEvent::Dismiss);
             if disposition != Disposition::Cancel {
@@ -249,13 +251,21 @@ pub struct NativeInput {
     thread_id: u32,
     thread: Option<std::thread::JoinHandle<()>>,
     handle: NativeInputHandle,
+    pub startup_unavailable: Vec<PluginFeatureHotkey>,
 }
 const WM_INPUT_COMMAND: u32 = WM_APP + 50;
 enum InputOperation {
-    Prepare(String),
+    Prepare(String, Vec<PluginFeatureHotkey>),
     Commit,
     Rollback,
     Panel(PanelSettings),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginFeatureHotkey {
+    pub plugin_id: String,
+    pub feature_id: String,
+    pub shortcut: String,
+    pub auto_copy: bool,
 }
 #[derive(Clone)]
 pub struct NativeInputHandle {
@@ -273,8 +283,8 @@ impl NativeInputHandle {
         }
         received.recv().unwrap_or(false)
     }
-    pub fn prepare(&self, shortcut: &str) -> bool {
-        self.request(InputOperation::Prepare(shortcut.into()))
+    pub fn prepare(&self, shortcut: &str, features: Vec<PluginFeatureHotkey>) -> bool {
+        self.request(InputOperation::Prepare(shortcut.into(), features))
     }
     pub fn commit(&self) -> bool {
         self.request(InputOperation::Commit)
@@ -370,11 +380,101 @@ impl<A: HotkeyApi> HotkeySlots<A> {
         }
     }
 }
+#[derive(Clone)]
+struct RegisteredFeatureHotkey {
+    target: (String, String),
+    binding: Binding,
+    id: i32,
+    auto_copy: bool,
+}
+struct FeatureHotkeySlots<A: HotkeyApi> {
+    api: A,
+    active: Vec<RegisteredFeatureHotkey>,
+    pending: Option<Vec<RegisteredFeatureHotkey>>,
+}
+impl<A: HotkeyApi> FeatureHotkeySlots<A> {
+    fn new(api: A) -> Self {
+        Self { api, active: Vec::new(), pending: None }
+    }
+    fn prepare(&mut self, hotkeys: Vec<PluginFeatureHotkey>) -> bool {
+        self.rollback();
+        let mut next = Vec::with_capacity(hotkeys.len());
+        let mut newly_registered = Vec::new();
+        for hotkey in hotkeys {
+            let Some(binding @ Binding::Chord { modifiers, .. }) = Binding::parse(&hotkey.shortcut) else {
+                for id in newly_registered { self.api.unregister(id); }
+                return false;
+            };
+            if modifiers == 0 {
+                for id in newly_registered { self.api.unregister(id); }
+                return false;
+            }
+            let target = (hotkey.plugin_id, hotkey.feature_id);
+            if let Some(existing) = self.active.iter().find(|entry| entry.target == target && entry.binding == binding) {
+                let mut retained = existing.clone();
+                retained.auto_copy = hotkey.auto_copy;
+                next.push(retained);
+                continue;
+            }
+            let used_ids = self.active.iter().map(|entry| entry.id).chain(next.iter().map(|entry: &RegisteredFeatureHotkey| entry.id));
+            let Some(id) = (100..=4099).find(|id| !used_ids.clone().any(|used| used == *id)) else {
+                for id in newly_registered { self.api.unregister(id); }
+                return false;
+            };
+            if !self.api.register(id, &binding) {
+                for id in newly_registered { self.api.unregister(id); }
+                return false;
+            }
+            newly_registered.push(id);
+            next.push(RegisteredFeatureHotkey { target, binding, id, auto_copy: hotkey.auto_copy });
+        }
+        self.pending = Some(next);
+        true
+    }
+    fn load(&mut self, hotkeys: Vec<PluginFeatureHotkey>) -> Vec<PluginFeatureHotkey> {
+        let mut unavailable = Vec::new();
+        for hotkey in hotkeys {
+            let Some(binding @ Binding::Chord { modifiers, .. }) = Binding::parse(&hotkey.shortcut) else { unavailable.push(hotkey); continue };
+            if modifiers == 0 { unavailable.push(hotkey); continue; }
+            let target = (hotkey.plugin_id.clone(), hotkey.feature_id.clone());
+            if self.active.iter().any(|entry| entry.target == target || entry.binding == binding) { unavailable.push(hotkey); continue; }
+            let used = self.active.iter().map(|entry| entry.id).collect::<std::collections::HashSet<_>>();
+            let Some(id) = (100..=4099).find(|id| !used.contains(id)) else { unavailable.push(hotkey); continue };
+            if self.api.register(id, &binding) {
+                self.active.push(RegisteredFeatureHotkey { target, binding, id, auto_copy: hotkey.auto_copy });
+            } else {
+                eprintln!("plugin shortcut: unable to register {}:{}", target.0, target.1);
+                unavailable.push(hotkey);
+            }
+        }
+        unavailable
+    }
+    fn commit(&mut self) {
+        if let Some(next) = self.pending.take() {
+            let retained = next.iter().map(|entry| entry.id).collect::<std::collections::HashSet<_>>();
+            for entry in &self.active {
+                if !retained.contains(&entry.id) { self.api.unregister(entry.id); }
+            }
+            self.active = next;
+        }
+    }
+    fn rollback(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let active = self.active.iter().map(|entry| entry.id).collect::<std::collections::HashSet<_>>();
+            for entry in pending {
+                if !active.contains(&entry.id) { self.api.unregister(entry.id); }
+            }
+        }
+    }
+    fn target(&self, id: i32) -> Option<(String, String, bool)> {
+        self.active.iter().find(|entry| entry.id == id).map(|entry| (entry.target.0.clone(), entry.target.1.clone(), entry.auto_copy))
+    }
+}
 impl NativeInput {
     pub fn handle(&self) -> NativeInputHandle {
         self.handle.clone()
     }
-    pub fn start(events: Sender<AppEvent>, shortcut: String) -> Self {
+    pub fn start(events: Sender<AppEvent>, shortcut: String, feature_hotkeys: Vec<PluginFeatureHotkey>) -> Self {
         *EVENTS.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(events.clone());
         let (ready, received) = std::sync::mpsc::sync_channel(1);
         let (commands, command_rx) =
@@ -410,15 +510,19 @@ impl NativeInput {
             let mut slots = HotkeySlots::new(Win32Hotkeys, !keys.is_null());
             let launcher = Binding::parse(&shortcut).is_some_and(|binding| slots.prepare(binding));
             slots.commit();
+            let mut feature_slots = FeatureHotkeySlots::new(Win32Hotkeys);
+            let unavailable = feature_slots.load(feature_hotkeys);
             DOUBLE_TAP.with(|tap| *tap.borrow_mut() = slots.observer_key().map(DoubleTap::new));
             eprintln!("app: input launcher={shortcut} registered={launcher} panel={panel_key} escape={} outside-click={}", !keys.is_null(), !pointer.is_null());
-            let _ = ready.send((id, !pointer.is_null()));
+            let _ = ready.send((id, !pointer.is_null(), unavailable));
             while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
                 if message.message == WM_HOTKEY {
                     if Some(message.wParam as i32) == slots.active_id() {
                         let _ = events.send(AppEvent::ToggleLauncher);
                     } else if message.wParam == 2 {
                         let _ = events.send(AppEvent::TogglePanel);
+                    } else if let Some((plugin_id, feature_id, auto_copy)) = feature_slots.target(message.wParam as i32) {
+                        let _ = events.send(AppEvent::InvokePluginFeature { plugin_id, feature_id, auto_copy });
                     }
                 }
                 if message.message == WM_TIMER
@@ -436,10 +540,18 @@ impl NativeInput {
                 if message.message == WM_INPUT_COMMAND {
                     while let Ok((operation, reply)) = command_rx.try_recv() {
                         let ok = match operation {
-                            InputOperation::Prepare(shortcut) => Binding::parse(&shortcut)
-                                .is_some_and(|binding| slots.prepare(binding)),
+                            InputOperation::Prepare(shortcut, feature_hotkeys) => {
+                                let launcher_ok = Binding::parse(&shortcut).is_some_and(|binding| slots.prepare(binding));
+                                let features_ok = launcher_ok && feature_slots.prepare(feature_hotkeys);
+                                if !features_ok {
+                                    slots.rollback();
+                                    feature_slots.rollback();
+                                }
+                                features_ok
+                            }
                             InputOperation::Commit => {
                                 slots.commit();
+                                feature_slots.commit();
                                 DOUBLE_TAP.with(|tap| {
                                     *tap.borrow_mut() = slots.observer_key().map(DoubleTap::new)
                                 });
@@ -447,6 +559,7 @@ impl NativeInput {
                             }
                             InputOperation::Rollback => {
                                 slots.rollback();
+                                feature_slots.rollback();
                                 true
                             }
                             InputOperation::Panel(settings) => {
@@ -489,10 +602,11 @@ impl NativeInput {
                 UnhookWindowsHookEx(pointer);
             }
         });
-        let (thread_id, _mouse_available) = received.recv().unwrap_or((0, false));
+        let (thread_id, _mouse_available, startup_unavailable) = received.recv().unwrap_or((0, false, Vec::new()));
         Self {
             thread_id,
             thread: Some(thread),
+            startup_unavailable,
             handle: NativeInputHandle {
                 thread_id,
                 commands,
@@ -519,6 +633,14 @@ impl Drop for NativeInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_capture_must_not_dismiss_an_inside_panel_click() {
+        assert!(!should_dismiss_panel(true, true, true));
+        assert!(!should_dismiss_panel(false, true, true));
+        assert!(should_dismiss_panel(true, true, false));
+        assert!(should_dismiss_panel(true, false, false));
+        assert!(should_dismiss_panel(false, true, false));
+    }
     #[derive(Default)]
     struct Api {
         slots: std::collections::HashMap<i32, Binding>,
@@ -535,6 +657,53 @@ mod tests {
         fn unregister(&mut self, id: i32) {
             self.slots.remove(&id);
         }
+    }
+    #[test]
+    fn feature_hotkey_load_reports_conflicts_and_keeps_other_bindings_active() {
+        let mut slots = FeatureHotkeySlots::new(Api::default());
+        slots.api.blocked = Binding::parse("Ctrl+Alt+B");
+        let make = |feature: &str, shortcut: &str| PluginFeatureHotkey {
+            plugin_id: "org.example.plugin".into(), feature_id: feature.into(), shortcut: shortcut.into(), auto_copy: false,
+        };
+        let failures = slots.load(vec![make("blocked", "Ctrl+Alt+B"), make("working", "Ctrl+Alt+A")]);
+        assert_eq!(failures, vec![make("blocked", "Ctrl+Alt+B")]);
+        assert_eq!(slots.active.len(), 1);
+        assert_eq!(slots.active[0].target.1, "working");
+    }
+    #[test]
+    fn feature_hotkey_load_reports_real_windows_registration_conflict() {
+        let mut slots = FeatureHotkeySlots::new(Win32Hotkeys);
+        let candidates = ["Ctrl+Alt+Shift+F12", "Ctrl+Alt+Shift+F9", "Ctrl+Alt+Shift+F8"];
+        let (shortcut, binding) = candidates.into_iter().find_map(|value| {
+            let binding = Binding::parse(value)?;
+            slots.api.register(990, &binding).then_some((value, binding))
+        }).expect("need one available test shortcut");
+        let failure = slots.load(vec![PluginFeatureHotkey {
+            plugin_id: "org.example.plugin".into(), feature_id: "open".into(), shortcut: shortcut.into(), auto_copy: false,
+        }]);
+        slots.api.unregister(990);
+        assert_eq!(failure.len(), 1);
+        assert_eq!(failure[0].shortcut, shortcut);
+        assert!(slots.active.is_empty());
+        assert!(matches!(binding, Binding::Chord { .. }));
+    }
+    #[test]
+    fn feature_hotkey_retains_binding_when_capture_option_changes_and_conflicts_roll_back() {
+        let mut slots = FeatureHotkeySlots::new(Api::default());
+        let hotkey = |shortcut: &str, auto_copy| PluginFeatureHotkey {
+            plugin_id: "org.example.plugin".into(), feature_id: "open".into(),
+            shortcut: shortcut.into(), auto_copy,
+        };
+        assert!(slots.prepare(vec![hotkey("Ctrl+Alt+A", false)]));
+        slots.commit();
+        let id = slots.active[0].id;
+        assert_eq!(slots.target(id).unwrap().2, false);
+        assert!(slots.prepare(vec![hotkey("Ctrl+Alt+A", true)]));
+        slots.commit();
+        assert_eq!(slots.target(id).unwrap().2, true);
+        slots.api.blocked = Binding::parse("Ctrl+Alt+B");
+        assert!(!slots.prepare(vec![hotkey("Ctrl+Alt+B", false)]));
+        assert_eq!(slots.target(id).unwrap().2, true);
     }
     #[test]
     fn preparation_keeps_old_shortcut_reserved_until_disk_commit() {

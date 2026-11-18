@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Check, FolderSearch, Keyboard, Puzzle, Settings2, Search, Mouse, Sparkles, Palette, Info } from '@lucide/vue'
+import { Check, Clock, FolderSearch, Keyboard, Puzzle, Settings2, Search, Mouse, Sparkles, Palette, Info } from '@lucide/vue'
 import { createDefaultAppData, type AppSettings, type LauncherDisplayMode, type ThemePreference } from '@/shared/domain'
 import { applyTheme } from '@/shared/theme'
 import SearchEngineEditor from './SearchEngineEditor.vue'
 import SuperPanelSettings from './SuperPanelSettings.vue'
 import SharedAISettings from './SharedAISettings.vue'
+import PluginMcpPanel from '../plugins/PluginMcpPanel.vue'
+import PluginScheduledTasksPanel from './PluginScheduledTasksPanel.vue'
 
 const props = defineProps<{ superPanelFocusRequestId?: string; aiFocusRequestId?: string }>()
 const emit = defineEmits<{ openPluginManagement: [] }>()
@@ -171,6 +173,7 @@ const categories = [
   { id: 'launcher', label: 'Launcher', icon: Search, description: '搜索框布局、快捷键与本机搜索服务。' },
   { id: 'super-panel', label: 'Super Panel', icon: Mouse, description: '由 NativeHost 管理的鼠标触发与上下文操作。' },
   { id: 'ai', label: 'AI', icon: Sparkles, description: 'WebTools 共用的提供方、模型与安全凭据。' },
+  { id: 'scheduled-tasks', label: '定时任务', icon: Clock, description: '查看各插件登记的任务、执行结果与暂停记录。' },
   { id: 'appearance', label: '外观', icon: Palette, description: '选择窗口颜色主题。' },
   { id: 'advanced', label: '高级', icon: Info, description: '版本信息与现有开发工具入口。' },
 ] as const
@@ -180,12 +183,13 @@ const activeDescription = computed(() => categories.find(category => category.id
 const categoryContent = ref<HTMLElement | null>(null)
 const aiEditor = ref<InstanceType<typeof SharedAISettings> | null>(null)
 const superPanelEditor = ref<InstanceType<typeof SuperPanelSettings> | null>(null)
+const scheduledTasksEditor = ref<InstanceType<typeof PluginScheduledTasksPanel> | null>(null)
 const pendingCategory = ref<SettingsSection | null>(null)
 const loading = ref(true)
 const loaded = ref(false)
 const savingStartup = ref(false)
 const version = ref('')
-const navigationBusy = computed(() => savingShortcut.value || savingTheme.value || savingLauncherMode.value || savingStartup.value || Boolean(aiEditor.value?.busy) || Boolean(superPanelEditor.value?.busy))
+const navigationBusy = computed(() => savingShortcut.value || savingTheme.value || savingLauncherMode.value || savingStartup.value || Boolean(aiEditor.value?.busy) || Boolean(superPanelEditor.value?.busy) || Boolean(scheduledTasksEditor.value?.busy))
 let loadGeneration = 0
 
 function selectCategory(category: SettingsSection): void {
@@ -316,7 +320,8 @@ onBeforeUnmount(() => {
     </div>
       </template>
       <SuperPanelSettings v-else-if="activeCategory === 'super-panel'" ref="superPanelEditor" :focus-request-id="props.superPanelFocusRequestId" />
-      <SharedAISettings v-else-if="activeCategory === 'ai'" ref="aiEditor" @saved="handleEnginesSaved" />
+      <template v-else-if="activeCategory === 'ai'"><PluginMcpPanel /><SharedAISettings ref="aiEditor" @saved="handleEnginesSaved" /></template>
+      <PluginScheduledTasksPanel v-else-if="activeCategory === 'scheduled-tasks'" ref="scheduledTasksEditor" />
       <template v-else-if="activeCategory === 'appearance'">
     <div class="settings-group appearance-settings">
       <div class="settings-group-heading"><span class="settings-group-icon" aria-hidden="true">◐</span><div><strong>外观主题</strong><p>选择 WebTools 窗口使用的颜色主题</p></div></div>

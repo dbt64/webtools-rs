@@ -35,7 +35,7 @@ export interface FeatureInvocationDependencies {
   isWebFeature?(ref: FeatureRef): boolean
   authorizeWeb?(ref: FeatureRef, dispatch: (authority: WebFeatureAuthority) => Promise<void>): Promise<{ completion: Promise<void> }>
   openWeb?(requestId: string, authority: WebFeatureAuthority, context?: InvocationTextContext): Promise<void>
-  activateWebFeature?(ref: FeatureRef, context?: InvocationTextContext, surface?: 'launcher' | 'super-panel', quickResult?: NodeCommandOptions): Promise<FeatureActivationOutcome | void>
+  activateWebFeature?(ref: FeatureRef, context?: InvocationTextContext, surface?: 'launcher' | 'super-panel' | 'hotkey', quickResult?: NodeCommandOptions): Promise<FeatureActivationOutcome | void>
   supportsQuickResult?(): boolean
   publishQuickResult?(payload: FeatureQuickResultPayload): Promise<void>
   clearQuickResult?(binding: FeatureResultControl): Promise<void>

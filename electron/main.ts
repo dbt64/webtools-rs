@@ -1,5 +1,14 @@
+import { clearPluginBrowserData } from './plugins/plugin-workflow-effects.ts'
+import { McpToolExecution } from './plugins/mcp-tool-execution.ts'
+import { NativeMcpGateway } from './services/native-mcp-gateway.ts'
+import { registerPluginMcpIpc } from './ipc/plugin-mcp-handlers.ts'
+import { McpAgentConfig } from './plugins/mcp-agent-config.ts'
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, protocol, session, utilityProcess, WebContentsView, type WebContents } from 'electron'
 import { randomUUID } from 'node:crypto'
+import type { JsonValue } from '../plugin-sdk/declarative-v1/web/protocol.mjs'
+import { ScheduledTaskExecution } from './plugins/scheduled-task-execution.ts'
+import { registerScheduledTasksIpc } from './ipc/scheduled-tasks-handlers.ts'
+import type { ManagedScheduledTask } from '../src/shared/ipc.ts'
 import { grantNativeHostForegroundPermission } from './services/native-focus-permission.ts'
 import { realpathSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -29,6 +38,7 @@ import { EverythingClient } from './services/everything-client'
 import { isValidTranslationText } from './services/translation-prefill'
 import { bindWindowStartupTrace, currentWindowRequest, loadWindowShell, presentWindow, traceWindowStartup, withWindowRequest } from './services/window-startup.ts'
 import { registerWindowIpcHandlers } from './ipc/window-handlers'
+import { DEFAULT_HOST_HEIGHT, DEFAULT_HOST_WIDTH } from './services/host-window-geometry'
 import { registerWebsiteIpcHandlers } from './ipc/website-handlers'
 import { registerSettingsIpcHandlers } from './ipc/settings-handlers'
 import { registerTranslationIpcHandlers } from './ipc/translation-handlers'
@@ -160,6 +170,32 @@ let pluginWindows: PluginWindowManager | null = null
 let pluginTheme: PluginThemeController | null = null
 let featureActivation: FeatureActivationService | null = null
 let pluginCommands: NodeCommandExecutionAdapter | null = null
+let executeScheduledPluginTask: ((payload: unknown) => Promise<void>) | null = null
+const scheduledTaskExecution = new ScheduledTaskExecution()
+let nativeMcpGateway: NativeMcpGateway | null = null
+let mcpGatewayClient: NativeManagerClient | null = null
+let mcpDisabledPlugins = new Set<string>()
+async function readMcpPreferences(): Promise<void> {
+  if (!nativeManagerClient?.supportsMcpGateway) throw new Error('无法连接本地 MCP 服务，请确认 WebTools 托盘仍在运行。')
+  const preferences = await nativeManagerClient.request<{ disabledPlugins: string[] }>('mcp-admin-preferences-v1', {})
+  mcpDisabledPlugins = new Set(preferences.disabledPlugins)
+}
+async function syncNativeMcpTools(): Promise<void> {
+  const client = nativeManagerClient
+  if (!client?.supportsMcpGateway || !pluginManager || !pluginCommands) return
+  if (mcpGatewayClient !== client) {
+    nativeMcpGateway?.close()
+    nativeMcpGateway = new NativeMcpGateway(client, new McpToolExecution(pluginManager, pluginCommands, id => !mcpDisabledPlugins.has(id)))
+    mcpGatewayClient = client
+  }
+  await readMcpPreferences()
+  await nativeMcpGateway!.publishTools(pluginManager.listMcpTools())
+}
+async function dispatchScheduledTaskOperation(method: 'request' | 'list' | 'remove', pluginId: string, featureId: string, payload: JsonValue): Promise<JsonValue> {
+  if (!nativeManagerClient?.isConnected) throw new Error('Scheduled tasks require the running Rust tray host')
+  return nativeManagerClient.request<JsonValue>(`plugin-tasks-${method}`, { pluginId, featureId,
+    ...(method === 'request' ? { request: payload } : method === 'remove' ? payload as { code: string } : {}) }, 10_000)
+}
 let commandCapabilityEffects: Omit<WebCapabilityEffects, 'hasForegroundGesture'> | null = null
 let effectsForWindow: ((getWindow: () => BrowserWindow | null) => Omit<WebCapabilityEffects, 'hasForegroundGesture'>) | null = null
 let electronHostReady = false
@@ -249,6 +285,7 @@ async function refreshFeatureRegistry(): Promise<void> {
   try {
     await featureRegistry?.refresh()
     await syncNativeFeatureProjection()
+    await syncNativeMcpTools()
   }
   catch (error) { console.warn('[native-features] derived Feature projection refresh failed.', error) }
 }
@@ -347,6 +384,31 @@ function closeTranslationSurface(): Promise<void> {
 }
 
 async function handleNativeManagerCommand(message: NativeManagerEnvelope): Promise<void | (() => void) | ReturnType<typeof nativeManagerReply>> {
+  if (message.type === 'mcp-sync-v1') {
+    await syncNativeMcpTools()
+    return nativeManagerReply({ synchronized: true })
+  }
+  if (message.type === 'mcp-call-v1') {
+    if (quitting || !nativeMcpGateway || !message.payload || typeof message.payload !== 'object' || !('callId' in message.payload) || typeof message.payload.callId !== 'string') throw new NativeManagerRequestError('MCP_UNAVAILABLE', 'MCP 执行引擎不可用。')
+    const gateway = nativeMcpGateway
+    return hostOwnership.execute(message.payload.callId, async () => {
+      activationInFlight++
+      try { return await gateway.handleCommand(message) }
+      finally { activationInFlight--; maybeQuitIdleElectronHost() }
+    })
+  }
+  if (message.type === 'mcp-call-cancel-v1') return nativeMcpGateway?.handleCommand(message)
+  if (message.type === 'plugin-task-trigger') {
+    if (quitting || !executeScheduledPluginTask) throw new NativeManagerRequestError('HOST_CLOSING', 'Scheduled execution unavailable.')
+    activationInFlight++
+    try { await executeScheduledPluginTask(message.payload); return nativeManagerReply({ success: true }) }
+    catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : ''
+      const suspended = ['PLUGIN_DISABLED', 'NOT_INSTALLED', 'PERMISSION_DENIED', 'ACTION_NOT_DECLARED', 'INCOMPATIBLE_PLUGIN', 'INTEGRITY_FAILED'].includes(code)
+      return nativeManagerReply({ success: false, suspended, error: error instanceof Error ? error.message.slice(0, 1024) : 'Scheduled execution failed' })
+    }
+    finally { activationInFlight--; maybeQuitIdleElectronHost() }
+  }
   if (message.type === 'host-ownership-sync') {
     if (quitting) throw new NativeManagerRequestError('HOST_CLOSING', 'Electron Host is closing.')
     hostOwnership.replace(message.payload)
@@ -525,11 +587,14 @@ async function synchronizeNativeOwnership(client: NativeManagerClient): Promise<
 }
 
 async function connectNativeHost(): Promise<NativeManagerClient> {
-  const client = new NativeManagerClient(nativePipeName, nativePipeAuthenticationToken, true, true)
+  const client = new NativeManagerClient(nativePipeName, nativePipeAuthenticationToken, true, true, true)
   nativeManagerClient = client
   client.onCommand(handleNativeManagerCommand)
   client.onDisconnect(error => {
     if (client !== nativeManagerClient || quitting) return
+    nativeMcpGateway?.close()
+    nativeMcpGateway = null
+    mcpGatewayClient = null
     hostOwnership.disconnected()
     traceWindowStartup('named-pipe-disconnected')
     featureQuickResultConsent?.close()
@@ -561,6 +626,7 @@ async function reconnectNativeHost(): Promise<void> {
       await syncNativeWebsiteProjection()
       await syncNativePluginProjection()
       await syncNativeFeatureProjection()
+      await syncNativeMcpTools().catch(() => console.warn('[mcp] Tool catalog synchronization unavailable.'))
       lastDevelopmentProjectionKey = ''
       await syncNativeDevelopmentProjection()
       deliverPendingNativeIntent()
@@ -584,8 +650,8 @@ function createWindow(): void {
   managerRendererReady = false
   managerClosing = null
   const window = new BrowserWindow({
-    width: 1040,
-    height: 720,
+    width: DEFAULT_HOST_WIDTH,
+    height: DEFAULT_HOST_HEIGHT,
     minWidth: 840,
     minHeight: 600,
     backgroundColor: '#10151c',
@@ -593,6 +659,7 @@ function createWindow(): void {
     icon: brandResourcePath('app.ico'),
     show: false,
     frame: false,
+    skipTaskbar: true,
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -722,13 +789,54 @@ app.whenReady().then(async () => {
     (authority, owner) => {
       const store = authority?.development ? pluginDevelopment?.capabilityStore(authority) : pluginManager?.store
       const effects = owner && effectsForWindow ? effectsForWindow(() => owner.isDestroyed() ? null : owner) : webCapabilityEffects
-      return store && effects ? { store, effects } : null
+      return store && effects ? { store, effects: { ...effects, scheduledTasks: dispatchScheduledTaskOperation } } : null
     },
     authority => authority.development
       ? pluginDevelopment?.resolveNodeRuntimePaths(authority) ?? Promise.reject(new Error('Development session unavailable'))
       : pluginManager ? pluginManager.resolveNodeRuntimePaths(authority) : Promise.reject(new Error('Plugin Manager is unavailable')),
     runtimeDiagnostics, pluginTheme ?? undefined, (window, input) => pluginWindows?.handleInput(window, input) ?? false,
-    (window, point) => pluginWindows?.handlePluginMouseDown(window, point), bindWindowStartupTrace())
+    (window, point) => pluginWindows?.handlePluginMouseDown(window, point), bindWindowStartupTrace(),
+    (window, action) => pluginWindows?.applySearchUi(window, action),
+    (window, id, request) => pluginWindows ? pluginWindows.dispatchPluginWindow(window, id, request) : Promise.reject(new Error('Window manager unavailable')))
+  executeScheduledPluginTask = async payload => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid scheduled execution')
+    const task = payload as Record<string, unknown>
+    if (!['pluginId', 'featureId', 'code', 'executionId'].every(k => typeof task[k] === 'string' && (task[k] as string).length > 0 && (task[k] as string).length <= 128)
+      || !Number.isSafeInteger(task.scheduledAtMs)) throw new Error('Invalid scheduled execution')
+    const manager = pluginManager
+    if (!manager) throw new Error('Plugin manager unavailable')
+    // Resolve the installed package and current grants on every tick. Cached task
+    // records do not authorize a disabled, removed or updated plugin.
+    await scheduledTaskExecution.execute(`${task.pluginId}\0${task.code}`,
+      dispatch => manager.authorizeWebFeature({ pluginId: task.pluginId as string, featureId: task.featureId as string }, null, dispatch), async (authority, signal) => {
+      let window: BrowserWindow | undefined
+      let runtime: WebPluginRuntime | undefined
+      const abort = () => { authority.revoke(); void runtime?.close().catch(() => {}) }
+      signal.addEventListener('abort', abort, { once: true })
+      try {
+        if (signal.aborted) throw new Error('Scheduled execution cancelled before dispatch')
+        if (!authority.isCurrent('plugin.tasks')) throw Object.assign(new Error('Scheduled task permission revoked'), { code: 'PERMISSION_DENIED' })
+        const event = { code: task.code as string, executionId: task.executionId as string, scheduledAtMs: task.scheduledAtMs as number }
+        const feature = authority.snapshot.manifest.features.find(f => f.id === authority.featureId)!
+        if (feature.entry.kind === 'node-command') {
+          const result = await pluginCommands!.execute(authority, undefined, { task: event, signal })
+          if (result.status !== 'completed') throw new Error('Scheduled command cancelled')
+        } else {
+          // Separate execution-owned surface: never reuse or replace a visible
+          // plugin window; never emit launcher enter/show lifecycle events.
+          window = new BrowserWindow({ show: false, skipTaskbar: true, focusable: false, width: 640, height: 480,
+            webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, backgroundThrottling: false } })
+          runtime = createFeatureRuntime(() => window && !window.isDestroyed() ? window : null)
+          await runtime.openAuthority(authority)
+          if (signal.aborted) throw new Error('Scheduled execution cancelled during load')
+          await runtime.runScheduledTask(event)
+        }
+      } finally {
+        signal.removeEventListener('abort', abort)
+        try { await runtime?.close() } finally { if (window && !window.isDestroyed()) window.destroy(); authority.revoke() }
+      }
+    })
+  }
   webPluginRuntime = createFeatureRuntime(() => managerWindow)
   pluginWindows = new PluginWindowManager({ createRuntime: createFeatureRuntime, theme: pluginTheme,
     defaultIcon: brandResourcePath('app.ico'), chromePreload: join(__dirname, '../preload/plugin-window-chrome.js'), onSurfacesChanged: maybeQuitIdleElectronHost,
@@ -752,6 +860,16 @@ app.whenReady().then(async () => {
     if (!owner) return false
     return pluginWindows?.performChromeAction(owner, action) ?? false
   })
+  ipcMain.handle(PLUGIN_WINDOW_CHROME_CHANNELS.input, (event, value: unknown) => {
+    const owner = pluginWindows?.chromeOwnerFor(event.sender, event.senderFrame)
+    if (!owner) return false
+    return pluginWindows?.searchInputChanged(owner, value) ?? false
+  })
+  ipcMain.handle(PLUGIN_WINDOW_CHROME_CHANNELS.selectResult, (event, id: unknown) => {
+    const owner = pluginWindows?.chromeOwnerFor(event.sender, event.senderFrame)
+    if (!owner) return false
+    return pluginWindows?.selectSearchResult(owner, id) ?? false
+  })
   pluginRuntimeSession.onHostDialogsClosed = window => pluginWindows?.hostDialogsClosed(window)
   pluginCommands = new NodeCommandExecutionAdapter({
     fork: (file, options) => utilityProcess.fork(file, [], options),
@@ -761,7 +879,7 @@ app.whenReady().then(async () => {
     capabilities: authority => {
       const store = authority.development ? pluginDevelopment?.capabilityStore(authority) : pluginManager?.store
       if (!store || !commandCapabilityEffects) throw new Error('Command Host capabilities unavailable.')
-      return { store, effects: commandCapabilityEffects }
+      return { store, effects: { ...commandCapabilityEffects, scheduledTasks: dispatchScheduledTaskOperation } }
     }, diagnostics: runtimeDiagnostics, onOwnershipChanged: maybeQuitIdleElectronHost,
     onCleanupFailed: () => { console.error('[plugins] Command cleanup failed; exiting this Electron Host.'); app.quit() },
   })
@@ -953,8 +1071,14 @@ app.whenReady().then(async () => {
   })
   const runtimeAcceptanceHostOverrides = pluginRuntimeAcceptanceOptions
     ? createPluginRuntimeAcceptanceHostOverrides(pluginRuntimeAcceptanceOptions) : undefined
-  const pluginHost = createElectronPluginHost({ userData: app.getPath('userData'), hostVersion: app.getVersion(), sharedAI: sharedAIService, dataStore, getWindow: () => managerWindow,
-    deleteRuntimeData: pluginId => webPluginRuntime?.clearPluginData(pluginId) ?? Promise.resolve(),
+  const pluginHost = createElectronPluginHost({ userData: app.getPath('userData'), hostVersion: app.getVersion(), sharedAI: sharedAIService, dataStore, nativeHostExecutable, getWindow: () => managerWindow,
+    getFeatureShortcut: (pluginId, featureId) => currentSettings().pluginFeatureShortcuts.find(item => item.pluginId === pluginId && item.featureId === featureId)?.shortcut ?? null,
+    pasteText: async text => {
+      if (!nativeManagerClient?.isConnected || !await prepareNativeLauncherFocus()) throw new Error('Native focus handoff unavailable')
+      const result = await nativeManagerClient.request<{ pasted: boolean }>('plugin-paste-text-v1', { text }, 5000)
+      if (!result.pasted) throw new Error('Original application unavailable')
+    },
+    deleteRuntimeData: async pluginId => { await webPluginRuntime?.clearPluginData(pluginId); await clearPluginBrowserData(pluginId) },
     clearTemporaryWindowTarget: pluginId => pluginWindows?.clearInstalledTemporaryTarget(pluginId),
     closeFeatureWindows: async pluginId => { await Promise.all([pluginWindows?.closePlugin(pluginId), pluginCommands?.cancelPlugin(pluginId)]) } }, runtimeAcceptanceHostOverrides)
   webCapabilityEffects = pluginHost.webEffects
@@ -972,7 +1096,8 @@ app.whenReady().then(async () => {
   })
   pluginDevelopment = new PluginDevelopment({ runtime: {
     clearWindowTarget: sessionId => pluginWindows?.clearDevelopmentTemporaryTarget(sessionId),
-    activate: async authority => { await featureActivation!.activateAuthorized(authority, 'manager') },
+    activate: async (authority, invocation) => { await featureActivation!.activateAuthorized(authority, invocation?.surface ?? 'manager',
+      invocation?.context ? { ...invocation.context, ageMs: 0 } : undefined) },
     beginReload: sessionId => {
       const reload = pluginWindows!.beginDevelopmentReload(sessionId)
       return { get featureIds() { return reload.featureIds },
@@ -1019,6 +1144,8 @@ app.whenReady().then(async () => {
   })
   try { await pluginHost.manager.initialize(); pluginManager = pluginHost.manager }
   catch { pluginHost.manager.close() } // Fail closed without preventing existing Manager pages from opening.
+  const mcpAgents = new McpAgentConfig()
+  await syncNativeMcpTools().catch(() => console.warn('[mcp] Tool catalog synchronization unavailable.'))
   featureRegistry = new FeatureRegistry({
     listDeclarativeFeatures: () => pluginManager?.listFeatureCandidates() ?? Promise.resolve([]),
     listRuntimeFeatures: () => pluginManager?.listRuntimeFeatureCandidates() ?? Promise.resolve([]),
@@ -1026,6 +1153,11 @@ app.whenReady().then(async () => {
   })
   if (pluginManager) {
     disposeFeatureManagerSubscription = pluginManager.subscribeFeatureAuthorityChanged(pluginId => {
+      if (pluginId) void pluginManager?.list().then(rows => {
+        const plugin = rows.find(p => p.id === pluginId)
+        if (!plugin?.enabled || !plugin.granted.includes('plugin.tasks'))
+          void nativeManagerClient?.request('plugin-tasks-suspend', { pluginId }, 5000).catch(() => {})
+      })
       if (pluginId && !quitting) void nativeManagerClient?.clearAcceptedQuickResultForSource(pluginId).catch(() => console.warn('[quick-result] Source clear was not acknowledged.'))
       void refreshFeatureRegistry()
       void featureInvocationService?.revalidateDisplayedResult().catch(() => {})
@@ -1134,6 +1266,17 @@ app.whenReady().then(async () => {
     isManagerMainFrame: context => isCurrentWindowMainFrame(context, managerWindow),
     choosePackage: pluginHost.choosePackage,
   })
+  registerPluginMcpIpc(ipcMain, {
+    isManagerMainFrame: context => isCurrentWindowMainFrame(context, managerWindow),
+    listTools: () => (pluginManager?.listMcpTools() ?? []).map(({ pluginId, featureId, title, description }) => ({ pluginId, featureId, title, description })),
+    agents: mcpAgents,
+    request: async (type, payload) => {
+      if (!nativeManagerClient?.supportsMcpGateway) throw new Error('无法连接本地 MCP 服务，请确认 WebTools 托盘仍在运行。')
+      const result = await nativeManagerClient.request(type, payload)
+      if (type === 'mcp-admin-set-plugin-enabled-v1') await readMcpPreferences()
+      return result
+    },
+  })
   const bookmarkService = new BookmarkService(dataStore)
   const websiteService = new WebsiteService(dataStore)
   const websiteMetadata = new WebsiteMetadataService()
@@ -1143,9 +1286,26 @@ app.whenReady().then(async () => {
     isManagerMainFrame: context => isCurrentWindowMainFrame(context, managerWindow),
     markManagerRendererReady,
     acknowledgeNativeManagerIntent,
-    performManagerWindowAction: action => {
+    performManagerWindowAction: async action => {
       const window = managerWindow
       if (!window || window.isDestroyed()) return { ok: false, error: { code: 'MANAGER_WINDOW_UNAVAILABLE', message: 'Manager 窗口当前不可用。' } }
+      if (action === 'toggle-detach') {
+        return pluginWindows?.toggleManagerDetached(window)
+          ? { ok: true, data: { maximized: window.isMaximized() } }
+          : { ok: false, error: { code: 'MANAGER_WINDOW_MODE_FAILED', message: 'Manager 窗口模式切换失败。' } }
+      }
+      if (action === 'exit-background') {
+        const exited = await pluginWindows?.exitManagerToBackground(window) ?? false
+        return exited
+          ? { ok: true, data: { maximized: window.isMaximized() } }
+          : { ok: false, error: { code: 'MANAGER_BACKGROUND_FAILED', message: 'Manager 暂时无法退出到后台。' } }
+      }
+      if (action === 'end-run') {
+        const ended = await pluginWindows?.endManagerRun(window) ?? false
+        return ended
+          ? { ok: true, data: { maximized: false } }
+          : { ok: false, error: { code: 'MANAGER_CLOSE_FAILED', message: 'Manager 暂时无法结束运行。' } }
+      }
       if (action === 'minimize') window.minimize()
       else if (action === 'toggle-maximize') {
         if (window.isMaximized()) window.unmaximize()
@@ -1164,6 +1324,24 @@ app.whenReady().then(async () => {
     onThemePreferenceChanged: () => pluginTheme?.refresh(),
     getSuperPanelSettings: () => requestSuperPanelSettings('super-panel-settings-get', {}),
     updateSuperPanelSettings: settings => requestSuperPanelSettings('super-panel-settings-update', settings),
+  })
+  registerScheduledTasksIpc(ipcMain, {
+    isManagerMainFrame: context => isCurrentWindowMainFrame(context, managerWindow),
+    list: async () => {
+      if (!nativeManagerClient?.isConnected) throw new Error('定时任务服务未连接，请通过 WebTools 托盘打开设置。')
+      const tasks: ManagedScheduledTask[] = []
+      for (let offset = 0; ; offset += 16) {
+        const page = await nativeManagerClient.request<ManagedScheduledTask[]>('plugin-tasks-admin-list', { offset }, 10_000)
+        tasks.push(...page)
+        if (page.length < 16) break
+      }
+      const plugins = new Map((await pluginManager?.list() ?? []).map(p => [p.id, p.name]))
+      return tasks.map(task => ({ ...task, pluginName: plugins.get(task.pluginId) ?? task.pluginId }))
+    },
+    remove: async (pluginId, code) => {
+      if (!nativeManagerClient?.isConnected) throw new Error('定时任务服务未连接，未删除任务。')
+      return nativeManagerClient.request<boolean>('plugin-tasks-admin-remove', { pluginId, code }, 10_000)
+    },
   })
   cancelAIConnectionTests = registerTranslationIpcHandlers(ipcMain, {
     sharedAIService,
@@ -1202,6 +1380,7 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', maybeQuitIdleElectronHost)
 
 app.on('before-quit', event => {
+  nativeMcpGateway?.close()
   if (webPluginRuntime && !runtimeQuitPrepared) {
     event.preventDefault()
     runtimeQuitPrepared = true

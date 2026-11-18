@@ -16,7 +16,7 @@ async function setup() {
   })
   const Sessions = runInNewContext(`${source}\nPluginRuntimeSession`, {
     session: { fromPartition: () => browserSession },
-    dialog: { showMessageBox: () => permission.promise, showSaveDialog: () => save.promise },
+    dialog: { showMessageBox: () => permission.promise, showSaveDialogSync: () => 'D:/example.txt' },
     setTimeout, clearTimeout,
   })
   const sessions = new Sessions(); const window = {}; const contents = { id: 1 }
@@ -27,17 +27,17 @@ async function setup() {
   return { sessions, window, contents, release, browserSession, permission, save, get settled() { return settled } }
 }
 
-test('permission and download dialogs share owner count and notify only after the final promise', async () => {
+test('download sets its path synchronously while preserving other pending dialog ownership', async () => {
   const h = await setup()
-  let allowed; let resumed = false
+  let allowed; let path
   h.browserSession.permission(h.contents, 'notifications', value => { allowed = value })
-  h.browserSession.emit('will-download', {}, { pause() {}, getFilename: () => 'example.txt', cancel() {}, setSavePath() {}, resume() { resumed = true } }, h.contents)
+  h.browserSession.emit('will-download', {}, { getFilename: () => 'example.txt', cancel() {}, setSavePath(value) { path = value } }, h.contents)
+  assert.equal(path, 'D:/example.txt')
   assert.equal(h.sessions.hasPendingHostDialogs(h.window), true)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(h.settled, 0)
   h.permission.resolve({ response: 1 }); await new Promise(resolve => setImmediate(resolve))
-  assert.equal(allowed, true); assert.equal(h.settled, 0)
-  assert.equal(h.sessions.hasPendingHostDialogs(h.window), true)
-  h.save.resolve({ canceled: false, filePath: 'D:/example.txt' }); await new Promise(resolve => setImmediate(resolve))
-  assert.equal(resumed, true); assert.equal(h.settled, 1)
+  assert.equal(allowed, true); assert.equal(h.settled, 1)
   assert.equal(h.sessions.hasPendingHostDialogs(h.window), false)
   await h.release()
 })

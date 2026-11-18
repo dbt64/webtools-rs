@@ -10,7 +10,7 @@ export interface PluginRecord { id: string; name: string; current: InstalledVers
 export const WEB_CAPABILITIES: readonly CapabilityV2[] = ['plugin.config.read', 'plugin.config.write', 'plugin.storage.read', 'plugin.storage.write', 'external.open', 'clipboard.write', 'clipboard.read', 'sharedAI.complete', 'network.domains']
 // Declaration vocabulary is wider than grantability while Gate 4 is uncertified.
 export const WEB_GRANTABLE_CAPABILITIES: readonly CapabilityV2[] = WEB_CAPABILITIES.filter(cap => cap !== 'network.domains')
-const V3_CAPABILITIES: readonly string[] = WEB_GRANTABLE_CAPABILITIES
+export const V3_CAPABILITIES: readonly string[] = [...WEB_GRANTABLE_CAPABILITIES, 'plugin.window.manage', 'clipboard.current.read', 'system.file.select', 'system.path.open', 'system.notification', 'system.input.paste', 'system.screen.capture', 'plugin.tasks', 'system.browser.automation', 'system.media.image', 'system.media.transcode']
 export interface RegistryData { registryVersion: 1; plugins: PluginRecord[] }
 export function validateIdentity(value: unknown): InstalledVersion {
   const item = record(value, ['version', 'hash']); versionParts(item.version)

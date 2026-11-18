@@ -173,6 +173,8 @@ pub enum AppEvent {
     ShowLauncher,
     ToggleLauncher,
     TogglePanel,
+    InvokePluginFeature { plugin_id: String, feature_id: String, auto_copy: bool },
+    PluginFeatureCaptured { plugin_id: String, feature_id: String, selection: Option<webtools_ipc::projection::Selection> },
     Dismiss,
     Escape,
     Quit,
@@ -212,6 +214,17 @@ pub enum AppEvent {
     },
 }
 
+fn plugin_feature_hotkeys(value: &serde_json::Value) -> Vec<native_input::PluginFeatureHotkey> {
+    value["pluginFeatureShortcuts"].as_array().into_iter().flatten().filter_map(|entry| {
+        Some(native_input::PluginFeatureHotkey {
+            plugin_id: entry["pluginId"].as_str()?.to_owned(),
+            feature_id: entry["featureId"].as_str()?.to_owned(),
+            shortcut: entry["shortcut"].as_str()?.to_owned(),
+            auto_copy: entry["autoCopy"].as_bool().unwrap_or(false),
+        })
+    }).collect()
+}
+
 struct NativeApp {
     launcher: Baseline,
     state: RefCell<SurfaceState>,
@@ -224,6 +237,7 @@ struct NativeApp {
     launcher_icons: RefCell<std::collections::HashMap<String, slint::Image>>,
     config: Config,
     runtime: RefCell<Option<HostRuntime>>,
+    mcp_server: RefCell<Option<Arc<crate::mcp_server::McpServerHandle>>>,
     ownership: webtools_ipc::HostOwnership,
     active_session: RefCell<Option<String>>,
     pending_handoff: RefCell<Option<PendingWindowHandoff>>,
@@ -233,7 +247,8 @@ struct NativeApp {
     host_events: RefCell<Option<Receiver<HostEvent>>>,
     events: Sender<AppEvent>,
     receiver: Receiver<AppEvent>,
-    external: Cell<isize>,
+    external: Cell<crate::paste_target::PasteTarget>,
+    pending_launcher_origin: Cell<Option<crate::paste_target::PasteTarget>>,
     workers: RefCell<Vec<std::thread::JoinHandle<()>>>,
     capture_cancel: RefCell<Option<Arc<AtomicBool>>>,
     settings: RefCell<serde_json::Value>,
@@ -312,7 +327,10 @@ impl NativeApp {
                         message: "Portable 预览不修改开机启动项，请在安装版 WebTools 中设置。",
                     });
                 }
-                if !input.prepare(change.next["quickSearchShortcut"].as_str().unwrap_or("")) {
+                if !input.prepare(
+                    change.next["quickSearchShortcut"].as_str().unwrap_or(""),
+                    plugin_feature_hotkeys(&change.next),
+                ) {
                     return Err(SettingsError::hotkey_unavailable());
                 }
             }
@@ -334,13 +352,13 @@ impl NativeApp {
                     crate::startup::apply(change.previous["launchOnStartup"].as_bool().unwrap_or(false))
                         .map_err(|_| SettingsError::unavailable())?;
                 }
-                if self.settings.borrow()["quickSearchShortcut"]
-                    != change.previous["quickSearchShortcut"]
-                {
+                if self.settings.borrow()["quickSearchShortcut"] != change.previous["quickSearchShortcut"]
+                    || self.settings.borrow()["pluginFeatureShortcuts"] != change.previous["pluginFeatureShortcuts"] {
                     if !input.prepare(
                         change.previous["quickSearchShortcut"]
                             .as_str()
                             .unwrap_or(""),
+                        plugin_feature_hotkeys(&change.previous),
                     ) || !input.commit()
                     {
                         return Err(SettingsError::hotkey_unavailable());
@@ -352,10 +370,16 @@ impl NativeApp {
         Ok(())
     }
     fn wire(self: &Rc<Self>) {
+        // Start the lightweight supervisor/timer at tray startup. Electron still
+        // starts only when a UI owner or a due scheduled task owns work.
+        self.ensure_manager();
         let weak = Rc::downgrade(self);
         self.launcher.on_query_edited(move |query| {
             if let Some(app) = weak.upgrade() {
                 app.query(&query);
+                if !query.trim().is_empty() && !query.trim().to_ascii_lowercase().starts_with("file:") {
+                    app.refresh_app_catalog();
+                }
                 if query.chars().count() >= app.config.min_chars.unwrap_or(2) {
                     app.ensure_manager();
                 }
@@ -806,17 +830,28 @@ impl NativeApp {
     fn show_launcher(&self) -> bool {
         self.show_launcher_with_ack(None)
     }
+    fn refresh_app_catalog(&self) {
+        let events = self.events.clone();
+        crate::index::request_refresh(crate::config::profile_root(), move || {
+            let _ = events.send(AppEvent::AppCatalogReady);
+        });
+    }
     fn show_launcher_with_ack(
         &self,
+        shown_reply: Option<std::sync::mpsc::SyncSender<bool>>,
+    ) -> bool {
+        self.show_launcher_from_origin(shown_reply, None)
+    }
+    fn show_launcher_from_origin(
+        &self,
         mut shown_reply: Option<std::sync::mpsc::SyncSender<bool>>,
+        origin: Option<crate::paste_target::PasteTarget>,
     ) -> bool {
         let returning_from_temporary_window = shown_reply.is_some();
-        let foreground = visual::current_foreground();
-        if foreground != 0
-            && foreground != crate::window_by_title("WebTools Super Panel")
-            && foreground != crate::window_by_title("WebTools Launcher Replica")
-        {
-            self.external.set(foreground);
+        if !returning_from_temporary_window {
+            if let Some(origin) = origin.or_else(|| crate::paste_target::PasteTarget::capture(visual::current_foreground())) {
+                self.external.set(origin);
+            }
         }
         self.hide();
         self.launcher_focus_pending
@@ -850,9 +885,20 @@ impl NativeApp {
             eprintln!("app: Launcher window preparation failed hwnd=0x{launcher_hwnd:x}");
         }
         visual::place_launcher_now();
-        let active = visual::restore_foreground(launcher_hwnd);
+        let active = visual::focus_launcher_window(launcher_hwnd);
         if active {
             self.launcher.invoke_focus_input();
+            // HWND creation queues winit activation events on the first show.
+            // Restore the editor after those events, without stealing focus if
+            // the user has already switched to another window.
+            let launcher = self.launcher.as_weak();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                if let Some(launcher) = launcher.upgrade() {
+                    let hwnd = crate::window_by_title("WebTools Launcher Replica");
+                    if launcher.window().is_visible() && hwnd != 0 && visual::current_foreground() == hwnd
+                        && visual::focus_launcher_window(hwnd) { launcher.invoke_focus_input(); }
+                }
+            });
         }
         if !active && std::env::var("WT_FOCUS_TRACE").is_ok() {
             eprintln!("app: Launcher is visible but Windows did not activate it on first request");
@@ -881,8 +927,7 @@ impl NativeApp {
         self.launcher_focus_pending.set(true);
         visual::place_launcher_now();
         let hwnd = crate::window_by_title("WebTools Launcher Replica");
-        let active =
-            hwnd != 0 && (visual::current_foreground() == hwnd || visual::restore_foreground(hwnd));
+        let active = visual::focus_launcher_window(hwnd);
         if active {
             self.launcher_focus_pending.set(false);
             self.launcher.invoke_focus_input();
@@ -911,10 +956,11 @@ impl NativeApp {
         let panel_anchor = visual::cursor_position();
         let foreground = visual::current_foreground();
         let foreground = if foreground == crate::window_by_title("WebTools Launcher Replica") {
-            self.external.get()
+            self.external.get().window
         } else {
             foreground
         };
+        if let Some(origin) = crate::paste_target::PasteTarget::capture(foreground) { self.external.set(origin); }
         self.hide_preserving_manager_session();
         visual::restore_foreground(foreground);
         let generation = self.state.borrow_mut().capture();
@@ -1117,6 +1163,7 @@ impl NativeApp {
             .as_ref()
             .is_some_and(HostRuntime::is_finished);
         if finished {
+            if let Some(server)=self.mcp_server.borrow_mut().take() { server.stop(); }
             if let Some(runtime) = self.runtime.borrow_mut().take() {
                 runtime.shutdown();
             }
@@ -1124,9 +1171,6 @@ impl NativeApp {
             eprintln!("app: replacing finished Manager runtime");
         }
         if self.runtime.borrow().is_some() {
-            return;
-        }
-        if !self.ownership.has_owners() {
             return;
         }
         let Some(exe) = self.config.manager_exe() else {
@@ -1145,6 +1189,11 @@ impl NativeApp {
             return;
         }
         let (events, receiver) = mpsc::channel();
+        let mcp_root=crate::config::profile_root();
+        // Only phase4g uses HostOptions.profile; production Manager keeps the established Nook userData.
+        let manager_profile=if args.iter().any(|arg|arg=="--phase4g-manager-test") {
+            webtools_ipc::mcp_store::mcp_profile_path(&mcp_root)
+        } else { mcp_root.clone() };
         let runtime = HostRuntime::start(
             exe,
             args,
@@ -1154,6 +1203,22 @@ impl NativeApp {
             self.launcher_state.clone(),
             self.projection_cache.clone(),
         );
+        match crate::mcp_server::McpServerHandle::new(&mcp_root,&manager_profile,runtime.mcp_dispatch(),runtime.handle()) {
+            Ok(server)=>{
+                let handler=server.clone(); runtime.set_mcp_handler(Box::new(move|kind,payload|handler.operation(kind,payload)));
+                if server.start_saved().is_err() { eprintln!("mcp: listener unavailable; Launcher remains usable"); }
+                self.mcp_server.replace(Some(server));
+            },
+            Err(_)=>{
+                runtime.set_mcp_handler(Box::new(move|kind,_| {
+                    match kind {
+                        "mcp-gateway-negotiate-v1"=>Ok(serde_json::json!({})),
+                        "mcp-admin-get-v1"=>Ok(serde_json::json!({"enabled":false,"running":false,"phase":"error","catalogReady":false,"activeCalls":0,"error":{"code":"MCP_CONFIG_INVALID","message":"无法读取本地 MCP 服务配置，原文件已保留。"}})),
+                        _=>Err("无法读取本地 MCP 服务配置，原文件已保留。".into())
+                    }
+                }));
+            }
+        }
         self.host_events.replace(Some(receiver));
         self.runtime.replace(Some(runtime));
         eprintln!("app: manager-owner=session-scoped");
@@ -1199,7 +1264,7 @@ impl NativeApp {
         let session = self.begin_manager_session();
         let command = command.with_request_ownership(Some(session.clone()));
         let request_id = command.request_id().unwrap_or_default().to_owned();
-        if matches!(source, Surface::Launcher | Surface::Panel) && !request_id.is_empty() {
+        if !request_id.is_empty() {
             self.pending_handoff.replace(Some(PendingWindowHandoff {
                 request_id,
                 session_id: session,
@@ -1312,6 +1377,10 @@ impl NativeApp {
             }
             self.focus_request_pending.set(false);
         }
+        // The pipe roundtrip may change foreground. Capture the input control
+        // while the user is still in the originating application.
+        let origin = crate::paste_target::PasteTarget::capture(visual::current_foreground());
+        self.pending_launcher_origin.set(origin);
         let sent = self.runtime.borrow().as_ref().is_some_and(|runtime| {
             if !runtime.is_connected() {
                 return false;
@@ -1325,7 +1394,7 @@ impl NativeApp {
             }
         });
         if !sent {
-            self.show_launcher();
+            self.show_launcher_from_origin(None, self.pending_launcher_origin.take());
         }
     }
     fn fallback_pending_focus_to_launcher(&self) {
@@ -1335,7 +1404,7 @@ impl NativeApp {
         let should_show = self.state.borrow().active == Surface::Hidden
             && !self.state.borrow().is_pending();
         if should_show {
-            self.show_launcher();
+            self.show_launcher_from_origin(None, self.pending_launcher_origin.take());
         }
     }
     fn cancel_panel_result(&self) {
@@ -1464,6 +1533,30 @@ impl NativeApp {
             }
             AppEvent::ToggleLauncher => self.toggle_launcher_or_temporary_window(),
             AppEvent::TogglePanel => self.capture(),
+            AppEvent::InvokePluginFeature { plugin_id, feature_id, auto_copy } => {
+                let foreground = visual::current_foreground();
+                if let Some(origin) = crate::paste_target::PasteTarget::capture(foreground) { self.external.set(origin); }
+                if auto_copy {
+                    let events = self.events.clone();
+                    self.workers.borrow_mut().push(std::thread::spawn(move || {
+                        let current = || visual::current_foreground() == foreground;
+                        let shell = if current() { crate::shell_context::capture_from(windows::Win32::Foundation::HWND(foreground as *mut _)) } else { None };
+                        let text = if shell.is_none() && current() { visual::capture_selection_while(current).unwrap_or_default() } else { String::new() };
+                        let selection = if current() { crate::panel_model::selection_for(&shell, &text) } else { None };
+                        let _ = events.send(AppEvent::PluginFeatureCaptured { plugin_id, feature_id, selection });
+                    }));
+                } else {
+                    let _ = self.events.send(AppEvent::PluginFeatureCaptured { plugin_id, feature_id, selection: None });
+                }
+            }
+            AppEvent::PluginFeatureCaptured { plugin_id, feature_id, selection } => {
+                let command = HostCommand::invoke_hotkey(plugin_id.clone(), feature_id.clone(), selection);
+                if self.is_command_feature(&plugin_id, &feature_id) {
+                    self.command(command);
+                } else {
+                    self.open_manager_target(command);
+                }
+            }
             AppEvent::MousePanel(version) => {
                 if version == native_input::panel_version() {
                     self.capture();
@@ -1746,6 +1839,14 @@ impl NativeApp {
                             webtools_ipc::session::SurfaceRequest::FocusLauncher => {
                                 let _ = reply.send(self.refocus_launcher_after_handoff());
                             }
+                            webtools_ipc::session::SurfaceRequest::PasteText { text } => {
+                                let target = self.external.get();
+                                // Keep Slint's message loop running while Windows
+                                // transfers activation and keyboard focus.
+                                self.workers.borrow_mut().push(std::thread::spawn(move || {
+                                    let _ = reply.send(target.paste_text(&text));
+                                }));
+                            }
                             webtools_ipc::session::SurfaceRequest::WindowPresented {
                                 request_id,
                                 window_handle,
@@ -1758,11 +1859,12 @@ impl NativeApp {
                     }
                     HostEvent::TemporaryWindowToggleHandled(handled) => {
                         self.focus_request_pending.set(false);
+                        let origin = self.pending_launcher_origin.take();
                         let show_launcher = !handled
                             && self.state.borrow().active == Surface::Hidden
                             && !self.state.borrow().is_pending();
                         if show_launcher {
-                            self.show_launcher();
+                            self.show_launcher_from_origin(None, origin);
                         }
                     }
                     HostEvent::Features(rows) => {
@@ -1938,8 +2040,7 @@ fn retry_launcher_focus(
 
         visual::place_launcher_now();
         let hwnd = crate::window_by_title("WebTools Launcher Replica");
-        let active = hwnd != 0
-            && (visual::current_foreground() == hwnd || visual::restore_foreground(hwnd));
+        let active = visual::focus_launcher_window(hwnd);
         if active {
             launcher.invoke_focus_input();
             handoff_pending.set(false);
@@ -2009,6 +2110,7 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
         launcher_icons: RefCell::new(std::collections::HashMap::new()),
         config: crate::config::load(),
         runtime: RefCell::new(None),
+        mcp_server: RefCell::new(None),
         ownership: webtools_ipc::HostOwnership::default(),
         active_session: RefCell::new(None),
         pending_handoff: RefCell::new(None),
@@ -2018,7 +2120,8 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
         host_events: RefCell::new(None),
         events: events.clone(),
         receiver,
-        external: Cell::new(visual::current_foreground()),
+        external: Cell::new(crate::paste_target::PasteTarget::capture(visual::current_foreground()).unwrap_or_default()),
+        pending_launcher_origin: Cell::new(None),
         workers: RefCell::new(Vec::new()),
         capture_cancel: RefCell::new(None),
         settings: RefCell::new(settings.clone()),
@@ -2032,6 +2135,12 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
         file_icon_pixels: RefCell::new(Vec::new()),
         file_category: Cell::new(crate::file_search::FileCategory::All),
     });
+    let catalog_events = events.clone();
+    let _catalog_watch = crate::catalog_watch::start(move || {
+        if crate::index::refresh_shortcuts() { let _ = catalog_events.send(AppEvent::AppCatalogReady); }
+        let notify = catalog_events.clone();
+        crate::index::invalidate_catalog(crate::config::profile_root(), move || { let _ = notify.send(AppEvent::AppCatalogReady); });
+    });
     app.launcher
         .set_file_categories(ModelRc::new(VecModel::from(
             crate::file_search::FileCategory::ALL
@@ -2043,6 +2152,7 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
     let input = native_input::NativeInput::start(
         events.clone(),
         settings["quickSearchShortcut"].as_str().unwrap().into(),
+        plugin_feature_hotkeys(&settings),
     );
     app.input.replace(Some(input.handle()));
     app.panel_settings
@@ -2052,9 +2162,16 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
     app.apply_theme();
     let theme_observer = crate::settings_ui::ThemeObserver::install();
     let tray = crate::tray::install(events);
+    if let Some(failed) = input.startup_unavailable.first() {
+        let count = input.startup_unavailable.len();
+        let message = format!("{} 的 {} 无法注册（共 {} 项）。请在插件管理中更换快捷键。", failed.feature_id, failed.shortcut, count);
+        if !tray.notify("插件快捷键不可用", &message) {
+            app.launcher.set_status(message.into());
+        }
+    }
     if panel_first {
         app.capture();
-    } else {
+    } else if !std::env::args().any(|arg| arg == "--startup") {
         app.show_launcher();
     }
     let weak = Rc::downgrade(&app);
@@ -2103,6 +2220,7 @@ pub fn run(panel_first: bool) -> Result<(), Box<dyn std::error::Error>> {
     drop(input);
     app.hide();
     crate::file_search::shutdown();
+    if let Some(server)=app.mcp_server.borrow_mut().take() { server.stop(); }
     if let Some(runtime) = app.runtime.borrow_mut().take() {
         runtime.shutdown();
     }

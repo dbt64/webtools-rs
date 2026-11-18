@@ -14,6 +14,7 @@ import {
   buildTranslation2Tabs,
   createTranslation2ViewState,
   isTranslation2RequestCurrent,
+  translation2ResultKey,
 } from './translation2-view-model.ts'
 
 const props = defineProps<{ initialBootstrap: Translation2Bootstrap | null }>()
@@ -56,6 +57,7 @@ let importedTestedRevision = -1
 let websiteResizeObserver: ResizeObserver | undefined
 let autoTranslateTimer: ReturnType<typeof window.setTimeout> | undefined
 let lastAutoTranslateSignature = ''
+let lastCompletedResultKey = ''
 
 const workspace = computed(() => bootstrap.value?.settings)
 const tabs = computed(() => bootstrap.value ? buildTranslation2Tabs(bootstrap.value.settings, bootstrap.value.websites) : [])
@@ -96,7 +98,7 @@ function replaceState(next: ReturnType<typeof createTranslation2ViewState>): voi
   Object.assign(state, next)
 }
 
-function invalidateResult(): void {
+function cancelPendingTranslation(): void {
   if (autoTranslateTimer !== undefined) {
     window.clearTimeout(autoTranslateTimer)
     autoTranslateTimer = undefined
@@ -104,10 +106,18 @@ function invalidateResult(): void {
   const request = state.request
   if (request) void window.translation2.cancel(request.id)
   state.request = null
+  state.contentGeneration += 1
+}
+
+function invalidateResult(): void {
+  cancelPendingTranslation()
   state.result = ''
   state.error = ''
-  state.contentGeneration += 1
   copied.value = false
+}
+
+function resultKey(): string {
+  return translation2ResultKey(state.sourceText, sourceLanguage.value, targetLanguage.value, selectedServiceValue.value)
 }
 
 function translationSignature(): string {
@@ -117,7 +127,8 @@ function translationSignature(): string {
   ])
 }
 
-function scheduleAutoTranslate(): void {
+function scheduleAutoTranslate(reuseCompleted = false): void {
+  if (reuseCompleted && state.result && lastCompletedResultKey === resultKey()) return
   invalidateResult()
   if (activeTab.value.kind !== 'webtools' || !canTranslate.value) return
   const signature = translationSignature()
@@ -142,7 +153,7 @@ function publishWebsiteBounds(): void {
 async function selectTab(tab: Translation2TabSelection, force = false): Promise<void> {
   const nextId = tab.kind === 'webtools' ? 'webtools' : tab.providerId
   if (!workspace.value || !force && activeTabId.value === nextId && !tabSelectionPending) return
-  invalidateResult()
+  cancelPendingTranslation()
   const revision = ++tabRevision
   tabSelectionPending = true
   const requestedSourceText = state.sourceText
@@ -162,7 +173,7 @@ async function selectTab(tab: Translation2TabSelection, force = false): Promise<
   await nextTick()
   if (websitePane.value) websiteResizeObserver?.observe(websitePane.value)
   publishWebsiteBounds()
-  if (tab.kind === 'webtools') scheduleAutoTranslate()
+  if (tab.kind === 'webtools') scheduleAutoTranslate(true)
 }
 
 async function toggleWebsite(providerId: Translation2WebsiteProviderId, visible: boolean): Promise<void> {
@@ -316,6 +327,7 @@ async function translate(automatic = false): Promise<void> {
   }
   if (!canTranslate.value) return
   const signature = translationSignature()
+  const completedKey = resultKey()
   if (automatic && signature === lastAutoTranslateSignature) return
   if (automatic) lastAutoTranslateSignature = signature
   const token = { id: crypto.randomUUID(), contentGeneration: state.contentGeneration }
@@ -338,7 +350,7 @@ async function translate(automatic = false): Promise<void> {
   }
   if (!isTranslation2RequestCurrent(state, token)) return
   state.request = null
-  if (result.ok) state.result = result.data.translation
+  if (result.ok) { state.result = result.data.translation; lastCompletedResultKey = completedKey }
   else state.error = result.error.message
 }
 

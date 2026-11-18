@@ -1,6 +1,7 @@
-//! WPF Launcher shortcut projection: saved websites and six projected features.
+//! WPF Launcher shortcut projection: saved websites and one primary entry per plugin.
 use crate::visual::Target;
 use serde_json::Value;
+use std::collections::HashSet;
 use webtools_ipc::projection::FeatureRow;
 
 #[derive(Clone)]
@@ -44,9 +45,21 @@ pub fn project(websites: &Value, features: &[FeatureRow]) -> (Vec<Shortcut>, Vec
             }
         })
         .collect();
+    let mut seen_plugins = HashSet::new();
     let mut features = features
         .iter()
         .filter(|feature| feature.feature_kind != "declarative-compatibility")
+        .filter(|feature| {
+            let is_translation = feature.plugin_id == "webtools.translation"
+                && feature.feature_id == "translate-text"
+                && feature.feature_kind == "built-in";
+            let is_primary_window =
+                feature.presentation.as_deref() == Some("window") || is_translation;
+
+            is_primary_window
+                && feature.is_general()
+                && seen_plugins.insert(feature.plugin_id.as_str())
+        })
         .collect::<Vec<_>>();
     features.sort_by_key(|feature| {
         !(feature.plugin_id == "webtools.translation" && feature.feature_id == "translate-text")
@@ -56,7 +69,7 @@ pub fn project(websites: &Value, features: &[FeatureRow]) -> (Vec<Shortcut>, Vec
         .take(6)
         .map(|feature| Shortcut {
             id: format!("{}/{}", feature.plugin_id, feature.feature_id),
-            title: feature.title.clone(),
+            title: feature.plugin_name.clone(),
             fallback: "⌘".into(),
             icon_token: feature.icon_token.clone(),
             icon_reference: feature.icon_data_url.clone(),
@@ -114,9 +127,17 @@ mod tests {
             title: id.into(),
             commands: Vec::new(),
             accepted_contexts: vec![AcceptedContext {
+                kind: ContextKind::None,
+                sources: Vec::new(),
+                extensions: None,
+                min_items: None,
+                max_items: None,
+                text_match: None,
+            }, AcceptedContext {
                 kind: ContextKind::Text,
                 sources: vec!["launcher-input".into()],
                 extensions: None,
+                min_items: None,
                 max_items: None,
                 text_match: None,
             }],
@@ -151,15 +172,15 @@ mod tests {
     }
 
     #[test]
-    fn projected_translation_is_first_without_removing_real_translation_features() {
+    fn projected_translation_is_first_and_shortcuts_show_one_entry_per_plugin() {
         let mut features = (0..8)
             .map(|i| feature(&format!("open-{i}"), "test.plugin"))
             .collect::<Vec<_>>();
         features.push(feature("translate-text", "webtools.translation"));
         let (_, plugins) = project(&json!([]), &features);
-        assert_eq!(plugins.len(), 6);
-        assert_eq!(plugins[0].title, "translate-text");
-        assert_eq!(plugins[1].title, "open-0");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].title, "插件");
+        assert!(matches!(&plugins[1].target, Target::Feature { feature, .. } if feature == "open-0"));
         assert!(plugins[0].icon_reference.is_some());
         assert!(
             matches!(&plugins[0].target, Target::Feature { plugin, feature, launcher_text }

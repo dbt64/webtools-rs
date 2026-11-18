@@ -5,7 +5,7 @@ export interface FeatureRef {
 }
 
 /** Invocation identifies the caller; presentation identifies the execution surface. */
-export type FeatureInvocationSurface = 'manager' | 'launcher' | 'super-panel'
+export type FeatureInvocationSurface = 'manager' | 'launcher' | 'super-panel' | 'hotkey'
 export type FeaturePresentation = import('../../plugin-sdk/runtime-v3/manifest-v3.mjs').FeaturePresentationV3
 
 export const FEATURE_ID_MAX_SCALARS = 64
@@ -25,6 +25,7 @@ export interface FeatureProjectionAcceptedContextV2 {
   readonly type: 'text' | 'files' | 'directories' | 'none'
   readonly sources: readonly FeatureProjectionContextSource[]
   readonly extensions?: readonly string[]
+  readonly minItems?: number
   readonly maxItems?: number
   readonly textMatch?: 'http-url'
 }
@@ -150,7 +151,7 @@ function hasOnlyArrayValues(value: unknown): value is unknown[] {
 
 function readProjectionContext(value: unknown): FeatureProjectionAcceptedContextV2 | null {
   if (!value || typeof value !== 'object') return null
-  const optional = ['extensions', 'maxItems', 'textMatch'].filter(key => Object.hasOwn(value, key))
+  const optional = ['extensions', 'minItems', 'maxItems', 'textMatch'].filter(key => Object.hasOwn(value, key))
   if (!hasExactDataFields(value, ['type', 'sources', ...optional]) || !['text', 'files', 'directories', 'none'].includes(String(value.type)) || !hasOnlyArrayValues(value.sources)) return null
   const allowed = value.type === 'text' ? ['launcher-input', 'clipboard', 'selected-text'] : value.type === 'none' ? [] : ['explorer-selection']
   if (value.sources.length < (value.type === 'none' ? 0 : 1) || value.sources.length > allowed.length) return null
@@ -165,13 +166,15 @@ function readProjectionContext(value: unknown): FeatureProjectionAcceptedContext
   if (optional.includes('textMatch') && (value.textMatch !== 'http-url' || value.type !== 'text'
     || sources.length !== 1 || sources[0] !== 'selected-text')) return null
   if (optional.includes('maxItems') && (!['files', 'directories'].includes(String(value.type)) || !Number.isInteger(value.maxItems) || (value.maxItems as number) < 1 || (value.maxItems as number) > 64)) return null
+  if (optional.includes('minItems') && (!['files', 'directories'].includes(String(value.type)) || !Number.isInteger(value.minItems) || (value.minItems as number) < 1 || (value.minItems as number) > 64 || optional.includes('maxItems') && (value.minItems as number) > (value.maxItems as number))) return null
   if (optional.includes('extensions') && (value.type !== 'files' || !hasOnlyArrayValues(value.extensions)
     || value.extensions.length > 16 || value.extensions.some(item => typeof item !== 'string' || !/^\.[a-z0-9]{1,16}$/.test(item))
     || new Set(value.extensions).size !== value.extensions.length)) return null
   return { type: value.type as FeatureProjectionAcceptedContextV2['type'], sources,
     ...(optional.includes('textMatch') ? { textMatch: 'http-url' as const } : {}),
     ...(optional.includes('extensions') ? { extensions: value.extensions as string[] } : {}),
-    ...(optional.includes('maxItems') ? { maxItems: value.maxItems as number } : {}) }
+    ...(optional.includes('maxItems') ? { maxItems: value.maxItems as number } : {}),
+    ...(optional.includes('minItems') ? { minItems: value.minItems as number } : {}) }
 }
 
 function readProjectionRow(value: unknown): FeatureProjectionRowV2 | null {

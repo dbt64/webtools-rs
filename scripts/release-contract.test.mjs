@@ -52,7 +52,7 @@ test('repository version contract reads the canonical product and independent pl
   assert.equal(contract.productVersion, '0.1.0')
   assert.equal(contract.pluginApiMajor, 1)
   assert.equal(contract.manifestVersion, 1)
-  assert.equal(contract.pluginSdkVersion, '1.8.0')
+  assert.equal(contract.pluginSdkVersion, JSON.parse(await readFile('plugin-sdk/declarative-v1/package.json', 'utf8')).version)
   assert.notEqual(contract.pluginApiMajor, contract.productVersion)
   assert.notEqual(contract.manifestVersion, contract.productVersion)
 })

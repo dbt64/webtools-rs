@@ -26,7 +26,7 @@ export type FeatureInvocationReasonCode =
 export interface FeatureInvocationRequest {
   readonly requestId: string
   readonly ref: FeatureRef
-  readonly source: 'launcher' | 'super-panel'
+  readonly source: 'launcher' | 'super-panel' | 'hotkey'
   readonly context?: InvocationContext & { readonly capturedAtUnixMs: number }
   readonly quickResult?: { readonly version: 1 }
 }
@@ -76,7 +76,7 @@ export function parseFeatureInvocationRequest(value: unknown): FeatureInvocation
   if (!hasExactOwnFields(value, ['requestId', 'ref', 'source', ...optional])
     || !isFeatureInvocationRequestId(value.requestId)
     || !isFeatureRef(value.ref)
-    || value.source !== 'launcher' && value.source !== 'super-panel') return null
+    || value.source !== 'launcher' && value.source !== 'super-panel' && value.source !== 'hotkey') return null
   if (optional.includes('quickResult') && (!hasExactOwnFields(value.quickResult, ['version']) || value.quickResult.version !== 1
     || value.source !== 'super-panel' || !optional.includes('context')
     || Object.getOwnPropertyDescriptor(value.context ?? {}, 'type')?.value !== 'text'
@@ -97,7 +97,7 @@ export function parseFeatureInvocationRequest(value: unknown): FeatureInvocation
       const { capturedAtUnixMs, ...payload } = context
       const parsed = validateInvocationContext(payload)
       if (!parsed || request.source === 'launcher' && (parsed.type !== 'text' || parsed.source !== 'launcher-input')
-        || request.source === 'super-panel' && parsed.source !== 'selected-text' && parsed.source !== 'explorer-selection') return null
+        || (request.source === 'super-panel' || request.source === 'hotkey') && parsed.source !== 'selected-text' && parsed.source !== 'explorer-selection') return null
       const normalized = { ...parsed, capturedAtUnixMs: capturedAtUnixMs as number }
       return withinJsonByteLimit({ ...request, context: normalized }, FEATURE_INVOCATION_MAX_BYTES) ? { ...request, context: normalized } : null
     } catch { return null }

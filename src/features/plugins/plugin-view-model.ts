@@ -1,8 +1,19 @@
 import type { PluginAction, InstalledPluginCapability as PluginCapability, PluginInstallResult, PluginSummary } from '../../shared/plugin-contracts.ts'
 
 const capabilityLabels: Record<PluginCapability, string> = {
+  'system.browser.automation': '操作插件独立的可视浏览器，读取和填写网页',
+  'system.media.transcode': '经选择保存位置后转换音视频（FFmpeg）',
+  'system.media.image': '调整图片尺寸并转换 PNG/JPEG',
+  'plugin.tasks': '经确认创建与管理定时任务',
   'clipboard.read': '仅在原生操作后接收一次剪贴板文本',
   'network.domains': '访问声明的网络域名（当前不支持）',
+  'plugin.window.manage': '创建并管理插件窗口',
+  'clipboard.current.read': '读取当前剪贴板',
+  'system.file.select': '选择文件或文件夹',
+  'system.path.open': '打开文件或文件夹',
+  'system.notification': '发送系统通知',
+  'system.input.paste': '向原应用粘贴文字',
+  'system.screen.capture': '读取显示器信息并截取屏幕',
   'manager.page': '添加 Manager 页面',
   'plugin.config.read': '读取插件设置',
   'plugin.config.write': '保存插件设置',
@@ -30,6 +41,10 @@ const recoveryHints: Record<string, string> = {
 }
 
 const capabilityDescriptions: Record<PluginCapability, string> = {
+  'system.browser.automation': '操作插件独立的可视浏览器，读取和填写网页',
+  'system.media.transcode': '经选择保存位置后转换音视频（FFmpeg）',
+  'system.media.image': '调整图片尺寸并转换 PNG/JPEG',
+  'plugin.tasks': '逐项确认后由托盘宿主定时运行插件；插件窗口关闭后仍可执行。',
   'manager.page': '在 WebTools 中打开已有的兼容插件页面。',
   'plugin.config.read': '读取该插件自己的设置，不包括 WebTools 全局设置和密钥。',
   'plugin.config.write': '保存该插件自己的设置。',
@@ -40,6 +55,13 @@ const capabilityDescriptions: Record<PluginCapability, string> = {
   'external.open': '由 WebTools 打开插件声明的网址。',
   'sharedAI.complete': '通过 WebTools 的 AI 配置请求结果；插件不会获取提供方密钥。',
   'network.domains': '旧网络域名能力在当前宿主中不可授予。',
+  'plugin.window.manage': '创建和管理属于该插件的辅助窗口。',
+  'clipboard.current.read': '在用户操作时读取当前剪贴板内容。',
+  'system.file.select': '通过系统对话框选择文件或文件夹。',
+  'system.path.open': '通过系统默认程序打开指定文件或文件夹。',
+  'system.notification': '向 Windows 通知中心发送插件消息。',
+  'system.input.paste': '在用户操作时向启动插件前的应用粘贴文字。',
+  'system.screen.capture': '读取显示器布局，并在用户操作时截取所选屏幕。',
 }
 
 /** Safe product copy for errors; raw runtime messages and paths stay in developer diagnostics. */

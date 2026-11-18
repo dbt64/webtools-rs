@@ -9,10 +9,10 @@ WebTools 是面向 Windows 的启动器、选区面板和插件效率工具。Ru
 - **启动器**：搜索本机应用、收藏网站、插件功能及文件；使用全局快捷键呼出。
 - **Super Panel**：根据选中文字提供搜索、翻译和插件操作，也支持快捷入口和 Quick Result。
 - **翻译**：Translation 2.0 使用独立窗口，提供 WebTools 翻译和网站翻译页签；翻译服务和 AI 凭据通过设置配置。
-- **插件平台**：管理本地插件及其权限、配置和生命周期，支持独立窗口与命令；仓库提供 SDK、脚手架及示例。
+- **插件平台**：管理本地插件及其权限、配置和生命周期，支持独立窗口与命令。SDK、脚手架和示例在 [webtools-plugin](https://github.com/dbt64/webtools-plugin)。
 - **Manager**：管理网址、插件、设置与共享 AI。插件和翻译使用独立窗口。
 
-第三方网页和翻译服务的可用性取决于网络和服务配置。插件开发请参阅 [开发指南](docs/plugin-development.md) 和 [脚手架说明](plugin-sdk/create-webtools-plugin/README.md)。
+第三方网页和翻译服务的可用性取决于网络和服务配置。插件开发请参阅 [作者指南](https://github.com/dbt64/webtools-plugin/blob/main/declarative-v1/docs/author-guide.md)。宿主侧集成说明在 [插件开发文档](docs/plugin-development.md)。
 
 ## 架构和目录
 
@@ -23,7 +23,7 @@ crates/webtools-ipc/           Rust 管道协议和状态
 prototype/slint-launcher/      Rust / Slint 宿主
 electron/                      Electron Host、插件运行时和服务
 src/                           Manager、翻译和共享前端契约
-plugin-sdk/、examples/         插件 SDK、脚手架与示例
+plugin-sdk/                    固定到 webtools-plugin 指定提交的 Git 子模块
 resources/                     品牌资源及 Everything 运行文件
 native/WebTools.UpdateHelper/  更新助手源码
 scripts/、docs/、tests/        构建工具、文档和测试
@@ -34,6 +34,8 @@ scripts/、docs/、tests/        构建工具、文档和测试
 ## Windows 开发
 
 需要 Windows x64、Rust 工具链、Visual Studio C++ 桌面开发工具、Node.js 22.7 以上和 pnpm 9.15.9。更新助手单独开发需要 .NET 10 SDK。
+
+新克隆使用 `git clone --recurse-submodules https://github.com/dbt64/webtools-rs.git`。已有克隆拉取后运行 `git submodule update --init --recursive`，取得宿主构建固定使用的 SDK 契约和示例。
 
 ```powershell
 pnpm install --frozen-lockfile

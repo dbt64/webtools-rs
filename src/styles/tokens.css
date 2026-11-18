@@ -27,6 +27,21 @@
   --manager-action-ink: #111b2c;
   --manager-selection: #203047;
   --manager-danger: #e4978d;
+  /* Shared host chrome contract: Manager and plugin windows use the same titlebar geometry. */
+  --webtools-window-chrome-height: 42px;
+  --webtools-window-chrome-start-padding: 14px;
+  --webtools-window-chrome-end-padding: 8px;
+  --webtools-window-chrome-action-size: 30px;
+  --webtools-window-chrome-action-radius: 5px;
+  --webtools-window-chrome-action-gap: 8px;
+  --webtools-window-chrome-identity-height: 30px;
+  --webtools-window-chrome-identity-padding: 0 6px 0 9px;
+  --webtools-window-chrome-identity-gap: 8px;
+  --webtools-window-chrome-icon-size: 20px;
+  --webtools-window-chrome-font-size: 13px;
+  --webtools-window-chrome-background: var(--surface);
+  --webtools-window-chrome-border: var(--manager-border);
+  --webtools-window-chrome-identity-background: var(--surface-raised);
   /* One bounded CSS-pixel density scale; rem respects font preferences and OS DPI. */
   --manager-unit: clamp(.8rem, calc(.75rem + .08vw), .875rem);
   --manager-font-body: calc(var(--manager-unit) * .875);

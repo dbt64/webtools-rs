@@ -34,7 +34,7 @@ uTools 的公开开发文档当前面向 8.0 及以上；本机之前逆向记�
 | 承载 | `electron/plugins/plugin-window-manager.ts` 已有无系统边框外壳、菜单、分离、任务栏切换及焦点/退出逻辑；Rust 启动器独立 | 几何、视觉连续性、搜索输入和交互细节对齐 |
 | 运行时 | Manifest v3 支持 Web/Node 窗口和 Node Command；v1 声明式兼容；窗口以 Feature 身份路由 | 明确统一的进入、恢复、退出事件，扩展按需展示 |
 | 上下文 | Feature 已声明文本、文件、目录和来源；支持扩展名、数量上限与所选文本 `http-url`；超级面板有文本 Quick Result | 扩展图片、窗口、匹配规则和各入口一致的调用行为 |
-| SDK | 源码 `@webtools/plugin-sdk` 1.8.0：context、config、storage、AI、clipboard 等；Node Command 支持外部链接 | 增加生命周期、动态功能、搜索与窗口接口；保持版本兼容 |
+| SDK | 源码 `@webtools/plugin-sdk` 1.9.0：context、config、storage、AI、clipboard、Feature 子输入与动态结果等；Node Command 支持外部链接 | 增加生命周期、动态功能与窗口接口；保持版本兼容 |
 | 样式 | `electron/renderer/plugin-window-chrome.*` 是宿主外壳；SDK `web/theme.css` 仅提供基础颜色 | 共用视觉规范、可选组件及一致主题，既有页面可继续使用原样式 |
 | 开发/管理 | 有项目生成器、开发会话、热重载、打包、本地安装和管理 | 完善真实作者流程、文档、诊断和在线分发 |
 | 搜索系统 | Rust Launcher 和 Super Panel 接收 Electron Feature 投影 | 增加动态结果、动态入口、插件子输入及一致排序 |
@@ -74,7 +74,7 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 | 超级面板 | 部分 | 文本、文件、文件夹、Explorer 当前目录、可用动作、Quick Result 及精确过滤 |
 | 输入匹配 | 部分 | 在已有类型和 `http-url` 基础上支持可表达的正则、数量、文件后缀、活动窗口/应用和可配置匹配；规则及开发错误可解释 |
 | 插件内子输入框 | 待做 | 设置/更新/移除输入区；变化回调、焦点与 IME 正确 |
-| 搜索框动态结果 | 待做 | 随查询更新的结果、点击/键盘执行、加载/空/错误状态与并发更新 |
+| 搜索框动态结果 | 已实现，待人工验收 | Feature 窗口宿主子输入、随查询更新的结果、点击/键盘选择、加载/空/错误状态与并发更新 |
 | 动态功能入口 | 待做 | 插件按用户配置创建、更新、查询、移除入口；持久化并同步搜索及面板 |
 | 生命周期与后台 | 部分 | 初始化、进入、再次进入、隐藏/退出后台、结束及关闭通知；上下文对应当前调用 |
 | 自定义窗口 | 部分 | 在已有分离窗口基础上，为插件提供可控窗口创建、尺寸、位置、显示、置顶、通信和关闭 |
@@ -101,7 +101,7 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 - [ ] 协调搜索框与插件窗口几何、缩放、显示和焦点；验证搜索入口、展开卡片和超级面板入口，避免闪烁、错位或多余空白。不要因为动画等待而推迟 Electron 启动。
 - [ ] 按第 3 节检查并修复默认/分离模式、任务栏、失焦、快捷键切换、Esc 返回、面板入口和 Manager 交互；回到搜索框必须能继续键盘输入和 Esc 退出。
 - [ ] 核对窗口/进程回收：隐藏仍保留状态；结束运行销毁该运行实例；其他窗口、任务和已安装 Everything 不被误关；无拥有者时沿用已有协作式退出。
-- [ ] 提供一个复用的测试插件包，包含窗口、输入框、计数状态、文本/文件动作和分离按钮；后续阶段在同一插件上扩展，只有新功能不能覆盖时才新增插件。
+- [x] 提供一个复用的测试插件包，包含窗口、输入框、计数状态、文本/文件动作和宿主分离入口；后续阶段在同一插件上扩展，只有新功能不能覆盖时才新增插件。（已提供 Manifest v3 `platform-playground` 样例与 `.wtplugin`；实机安装及窗口交互验收待用户。）
 
 **主要位置：** `electron/plugins/plugin-window-manager.ts`、`electron/renderer/plugin-window-chrome.*`、`electron/renderer/plugin-window-menu.*`、`electron/services/` 的 Native 通信、`native-rs/prototype/slint-launcher/src/app.rs` 与对应 Slint UI。实际修改前核对现有调用，不重建一套并行窗口管理器。
 
@@ -111,10 +111,10 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 
 **交付：** 设计令牌、可选插件 UI 基础样式/组件、真实样例。
 
-- [ ] 合并宿主外壳和插件可消费的颜色、字体、间距、图标、圆角、焦点样式；确认深浅色与高 DPI 的有效值。
-- [ ] 提供可选的基础样式/组件：容器、按钮、输入、开关、列表、标签、菜单、提示、加载、空状态和错误状态；兼容 Vanilla、Vue、React、Svelte 的普通 Web 使用方式。
-- [ ] 更新 SDK starter 默认引入统一样式；允许作者自行覆盖或不使用，旧插件不因未采用 UI 包而失效。
-- [ ] 扩展 P0 测试插件，覆盖主题切换、长文字、中英混排、窄窗口、键盘焦点和常用缩放。
+- [x] 合并宿主外壳和插件可消费的颜色、字体、间距、图标、圆角、焦点样式；颜色继续沿用 Host 注入 token，页面样式保持插件可选。
+- [x] 提供可选的基础样式：容器、按钮、输入、开关、列表、标签、菜单、提示、加载、空状态和错误状态；通过无框架依赖的 CSS 兼容 Vanilla、Vue、React、Svelte。
+- [x] 更新 SDK starter 默认引入统一样式；作者可覆盖或移除，旧插件不因未采用 UI 样式而受影响。
+- [x] 扩展 P0 测试插件，提供主题预览切换、长文字、中英混排、窄窗口布局、键盘焦点样式与浏览器缩放观察入口。
 
 **主要位置：** `plugin-sdk/declarative-v1/web/theme.css` 和新增 UI 样式/组件入口、`plugin-sdk/create-webtools-plugin/`、`docs/plugin-window-theme-contract.md`、`examples/plugins/`。
 
@@ -124,14 +124,14 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 
 **交付：** 插件可使用统一子输入区和主搜索结果列表；实现一个真实搜索型插件示例。
 
-- [ ] 在 Feature 会话上建立宿主输入区控制：申请/移除、占位文字、设置和读取文本、获得/释放焦点、输入变化事件；文字输入、中文 IME 和 Esc 行为正确。
-- [ ] 增加与当前查询绑定的动态结果：标题、描述、图标、稳定结果身份、键盘/鼠标选择、加载/空/错误状态。重复输入时只显示当前结果，不阻塞原有静态搜索。
-- [ ] 将输入和结果跨 Rust/Electron 通信接入当前 Feature 身份及生命周期；隐藏、结束、断开时关闭该会话，不能串到下一个插件。
-- [ ] 使用剪贴板搜索或具备本地数据的测试功能演示：进入后直接在顶部输入、逐字更新结果、Enter 打开、Esc 回到启动器；同时保持普通插件无需接入此能力。
+- [x] 在 Feature 会话上建立宿主输入区控制：显示/移除、占位文字、设置和读取文本、获得/释放焦点、输入变化事件；支持中文 IME、键盘与 Esc。（Electron Feature 宿主外壳与现有 SDK bridge 已实现；待用户安装包验收。）
+- [x] 增加与当前查询绑定的动态结果：标题、描述、图标、稳定结果身份、键盘/鼠标选择、加载/空/错误状态。查询修订号使过期结果不能覆盖当前输入；不阻塞普通静态搜索。（源码实现；待用户验收。）
+- [x] 将输入与结果绑定到当前 Electron Feature Runtime、窗口和运行代次；隐藏、结束或断开后不向其他 Feature 派发。（复用现有 Electron Feature Runtime/bridge；本功能不需要新增 Rust Named Pipe 消息。）
+- [x] 扩展可复用 `platform-playground`：通过宿主顶部输入搜索包内的本地剪贴板风格样例，支持 Enter/鼠标选择、无匹配与 Esc 返回插件页；不读取系统剪贴板、不联网；普通插件不启用此功能时保持原样。（示例包待人工验收。）
 
-**主要位置：** `src/shared/feature-contracts.ts`、`electron/services/feature-invocation-service.ts`、`electron/plugins/web-host-capabilities.ts`、`plugin-sdk/declarative-v1/web/`、`native-rs/crates/webtools-ipc/`、`native-rs/prototype/slint-launcher/src/app.rs` 和 `ui/`。
+**主要位置：** `electron/plugins/plugin-window-manager.ts`、`electron/plugins/web-plugin-runtime.ts`、`electron/renderer/plugin-window-chrome.*`、`plugin-sdk/declarative-v1/web/` 与 `examples/plugins/platform-playground/`。当前子输入属于 Electron Feature 窗口宿主外壳，不改变 Rust Launcher 的全局搜索协议。
 
-**完成表现：** 输入“剪贴板”进入后可以在同一顶部输入区搜索并操作结果；连续输入与中英文切换没有旧结果回跳。
+**完成表现：** 插件请求子输入后，可在 Feature 窗口同一顶部输入区搜索并操作结果；连续输入与中英文切换不会被旧结果覆盖。源码实现已完成，最终交互效果由用户安装包验收。
 
 ### P3：动态入口与上下文匹配
 
@@ -150,11 +150,13 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 
 **交付：** 可供第三方开发的完整基础能力，而不仅是宿主内部操作。
 
-- [ ] 提供初始化、进入、再次进入、隐藏/退出后台、结束/关闭的 SDK 通知与取消订阅；相同窗口被再次激活时送达新的上下文。
-- [ ] 支持必要的自定义窗口：创建、显示/隐藏、调整尺寸和位置、置顶、消息通信及关闭；主窗口/独立窗口/插件业务子窗口身份和归属清楚。
-- [ ] 增加常用桌面能力：选择文件或目录、打开文件/目录/HTTP(S)、系统通知、剪贴板文本/图片/文件、向原前台应用粘贴或输入、屏幕信息及截图。与现有 Node 能力明确边界。
-- [ ] 面向快捷操作增加应用级快捷入口和按需模拟输入；失焦恢复和外部输入以真实 Windows 交互验证。
-- [ ] 文档同时解释 API、何时使用、插件退出时资源行为与示例；旧 SDK、旧 Manifest 和已有配置不因新增接口失效。
+- [x] 提供初始化、进入、再次进入、隐藏/退出后台、结束/关闭的 SDK 通知与取消订阅；相同窗口被再次激活时送达新的上下文。（已有验收插件和用户测试反馈。）
+- [x] 支持必要的自定义窗口：创建、显示/隐藏、调整尺寸和位置、置顶、消息通信及关闭；主窗口/独立窗口/插件业务子窗口身份和归属清楚。（已有验收插件和用户测试反馈。）
+- [x] 增加常用桌面能力：选择文件或目录、打开文件/目录/HTTP(S)、系统通知、剪贴板文本/图片/文件、向原前台应用粘贴或输入、屏幕信息及截图。与现有 Node 能力明确边界。（已有验收插件和用户测试反馈。）
+- [x] 面向快捷操作增加应用级快捷入口和按需模拟输入；失焦恢复和外部输入以真实 Windows 交互验证。（用户已确认快捷键和此前的粘贴操作通过。）
+- [x] 文档同时解释 API、何时使用、插件退出时资源行为与示例；旧 SDK、旧 Manifest 和已有配置不因新增接口失效。（SDK 内置 P4 指南；通过旧声明式适配、现有 SDK 客户端和旧状态兼容回归。历史插件并未逐一运行。）
+
+收尾复核：P4 API 的用法、权限和资源行为已补入 `plugin-sdk/declarative-v1/docs/p4-api-guide.md`，并随 SDK 包分发；快捷键验收以用户实际测试结果为准。启动时注册冲突通知受到 Windows 通知设置影响，截图工具中的位图选区不保证经快捷键传递；这些限制不等于全部旧插件或全部桌面环境已逐一验证。
 
 **主要位置：** `plugin-sdk/declarative-v1/web/`、`node.d.mts`、`electron/plugins/web-host-capabilities.ts`、`electron/plugins/plugin-window-manager.ts`、现有 Native 通信实现。
 
@@ -162,13 +164,23 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 
 ### P5：插件数据、后台任务、AI 与扩展能力
 
+后续内存重构：[原生 MCP 网关设计](../specs/2026-11-17-native-mcp-gateway-design.md)、[实施计划](2026-11-17-native-mcp-gateway-plan.md)与[验证记录](../../mcp-native-gateway-validation.md)。此链接不更改 P5/P6 既有结项状态。
+
+**结项状态（2026-11-15）：** P5 按本计划范围完成。下列能力及五类样例已经分批交付，用户已确认最新定时任务完善验收全部通过。源码、交付包、自动验证与用户验收的对应关系见 [P5 结项记录](../../p5-completion.md)。
+
+**2026-11-15 定时任务收尾：** 补齐设置统一管理与最近 30 次执行日志，修复暂停重启、Cron 结束状态和时间戳边界。原定时提醒样例复用已有平台调度，非第二套计时方案。对标、差异及验证见 [定时任务收尾](../../p5-schedule-management.md)。用户已确认本轮实机验收通过。
+
+**2026-11-13 MCP 对齐补充：** 服务内置于设置 → AI；已实现持久地址/令牌、插件级工具开关、本机 Agent 检测与点击写入配置、完整 JSON 手动配置。原平台验收插件 1.17.0 增加 AI 便笺读写工具。实现与验证见 [内置 MCP 服务与 Agent 连接](../../p5-builtin-mcp-agent-connection.md)。该补充完成后的浏览器/媒体工作流已于 2026-11-15 交付并通过用户验收，见下方条目。
+
+
 **交付：** 与 uTools 常见高级插件相当的可组合能力。
 
-- [ ] 在已有 config 和 JSON storage 上补齐可用的数据读写、二进制/文件、查询、备份导入导出，以及升级/卸载保留规则；区分插件数据和共享凭据。
-- [ ] 增加由用户开启的定时任务和后台触发：任务登记、执行、取消、失败展示、退出与重启后的处理；避免以 Electron 永久常驻代替任务设计。
-- [ ] 在现有 Shared AI 上补齐实际需要的结果、取消和配置体验；支持插件声明可发现的工具、参数及结果，接入 MCP/Agent 调用。
-- [ ] 支持浏览器自动化、图像与音视频工作流：明确哪些使用 Node/插件依赖，哪些由宿主提供稳定接口；提供真实示例与错误反馈，不强制所有插件携带大依赖。
-- [ ] 样例覆盖：定时提醒、共享 AI 命令、注册一个 MCP 工具、图片或音视频处理、受控网页自动操作。
+- [x] 为已有 storage API 补齐 Web/Node 使用说明与可操作验收示例，说明 JSON/文件、前缀列表、备份替换、权限、升级/卸载保留规则，并区分插件数据、config 与共享凭据。（SDK API 原已实现；本项补齐指南和 platform-playground 1.14.0，修复备份文件异步导入后的 input 重置。）
+- [x] 增加由用户开启的定时任务和后台触发：任务登记、执行、取消、失败展示、退出与重启后的处理；避免以 Electron 永久常驻代替任务设计。使用下方的“定时提醒”样例验收这一能力。（2026-11-04 首次交付 SDK 1.14.0、platform-playground 1.15.0，Rust 托盘持久调度、一次/Cron、逐项确认、Web 隐藏回调与 Node 命令、暂停与执行统计已实现，随后通过用户验收。原始报告位于 `D:\SystemDefault\Desktop\webtoolstest\P5-Scheduled-Tasks-20261104-r1`；最新统一管理完善及用户确认见上方结项记录。）
+- [x] 使用可复用验收插件验证现有 Shared AI `ai.complete` 调用入口、宿主逐次确认、结果显示、插件侧取消与错误反馈；不修改底层 capability，不把此项标记为 MCP 工具注册。（platform-playground 1.16.0 首次交付，用户已确认验收通过，后续版本保留。）
+- [x] 支持插件声明可发现的工具、参数及结果，接入 MCP/Agent 调用。（2026-11-09：Manifest v3 `mcpTool` 接入 Node 命令运行时，Manager 可手动开启本机服务，使用官方 MCP 客户端通过打包版发现、调用和停用验证。配套样例为 MCP 工具验收 1.0.0。）
+- [x] 支持浏览器自动化、图像与音视频工作流：可视浏览器固定步骤、图片缩放/PNG/JPEG、宿主 FFmpeg 转换与错误反馈；SDK 1.15.0、platform-playground 1.18.0。2026-11-15 已实现并完成针对性自动验证，用户已确认本项实机测试通过；范围、退出行为和限制见 `docs/p5-browser-media-workflows.md`。
+- [x] 样例覆盖：定时提醒、共享 AI 命令、注册一个 MCP 工具、图片或音视频处理、受控网页自动操作。五类样例已随分项开发加入可复用验收插件并经过用户验收；共享 AI 命令以页面调用 SDK 的样例覆盖，原计划不要求另做无界面命令。2026-11-15 定时任务统一管理与日志也已通过本轮用户验收，详见 [P5 结项记录](../../p5-completion.md)。
 
 **主要位置：** `electron/plugins/` 的现有 capability 与 store、`electron/services/`、`plugin-sdk/`、`src/features/plugins/`、`native-rs/` 的调度/系统集成。具体 API 名称在实现前结合 SDK 现状确定并写入正式类型定义。
 
@@ -178,11 +190,11 @@ Manager 与普通插件统一宿主外观和焦点循环，但不把 Manager 当
 
 **交付：** 外部开发者不依赖 WebTools 源码即可完成开发和交付。
 
-- [ ] 统一 SDK、生成器、模板与文档版本；说明 Electron/Node ABI、Manifest、插件包和最低宿主版本。
-- [ ] 完善创建、启动、热重载、断线重连、日志/报错、验证、打包、安装和更新流程；开发模式能模拟 Launcher、面板、文件与文字入口。
-- [ ] 给 Vanilla/Vue/React/Svelte 提供最小可运行模板；覆盖普通窗口、子输入和动态结果、文件上下文、无界面命令、自定义窗口与统一 UI。
-- [ ] 保留 v1/v3 已安装插件和用户数据，变更字段或 API 时提供默认行为与迁移说明；不把现有插件强制改成新模板。
-- [ ] 输出完整作者文档：快速开始、Manifest、SDK API、上下文、生命周期、视觉、调试、分发、常见错误及实际示例。
+- [x] 统一 SDK、生成器、模板与文档版本；说明 Electron/Node ABI、Manifest、插件包和最低宿主版本。（2026-11-16：SDK/生成器 1.16.0、版本同步与漂移检查、新旧创建命令修正、纯 JavaScript Node 模板免 ABI 固定；四框架 × Web/Node 仓库外 tgz 消费、构建、打包及宿主安装校验通过。范围与证据见 [P6 开发工具与兼容](../../p6-toolchain-compatibility.md)。本项通过不代表后续热重载/上下文模拟与全部作者流程已完成。）
+- [x] 完善创建、启动、热重载、断线重连、日志/报错、验证、打包、安装和更新流程；开发模式能模拟 Launcher、面板、文件与文字入口。（2026-11-16：SDK/生成器 1.16.1；补齐开发面板五类入口模拟、上次项目显式重连、npm 锁文件监听与过期激活上下文回归。15 项定向测试、类型检查、版本检查及最终打包版端到端链路通过，包含自动重载保留上下文、报错恢复和正式包同 ID 升级保留数据。完整 Rust+Electron 预览及外部验收项目已交付，待用户实机确认。见 [P6 开发链路](../../p6-development-workflow.md)。）
+- [x] 给 Vanilla/Vue/React/Svelte 提供最小可运行模板；覆盖普通窗口、子输入和动态结果、文件上下文、无界面命令、自定义窗口与统一 UI。（2026-11-18：SDK/生成器 1.16.2，八组合构建和安装校验通过，打包版宿主交互自动验证通过，用户已确认本项验收全部通过。见 [P6 插件模板](../../p6-starter-templates.md)。）
+- [x] 保留 v1/v3 已安装插件和用户数据，变更字段或 API 时提供默认行为与迁移说明；不把现有插件强制改成新模板。（2026-11-18：旧版到当前打包 Manager 的同一隔离资料兼容、同 ID 升级和设置默认值、保留数据重装及显式删除通过 7 项打包验证。已交付预览和验收插件，待用户实机复核。见 [P6 已安装插件兼容](../../p6-installed-plugin-compatibility.md)。）
+- [x] 输出完整作者文档：快速开始、Manifest、SDK API、上下文、生命周期、视觉、调试、分发、常见错误及实际示例。（2026-11-18：新增 [WebTools 插件作者指南](https://github.com/dbt64/webtools-plugin/blob/main/declarative-v1/docs/author-guide.md) 及离线资料包。npm/pnpm 从本地工具包创建、构建、打包和检查更新包通过，随附 5 个插件包通过归档校验。资料包在桌面 `webtoolstest/P6-Author-Guide-20261118-r1`。）
 
 **主要位置：** `plugin-sdk/create-webtools-plugin/`、`plugin-sdk/declarative-v1/`、`electron/plugins/plugin-development.ts`、`src/features/plugins/PluginDevelopmentPanel.vue`、`docs/plugin-development.md`、`examples/plugins/`。
 

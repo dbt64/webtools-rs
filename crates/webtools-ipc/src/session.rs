@@ -29,6 +29,7 @@ pub struct HelloInfo {
 pub enum SurfaceRequest {
     ShowEmptyLauncher,
     FocusLauncher,
+    PasteText { text: String },
     WindowPresented {
         request_id: String,
         window_handle: u64,
@@ -37,6 +38,9 @@ pub enum SurfaceRequest {
 }
 
 pub type SurfaceRequestHandler = Box<dyn FnMut(SurfaceRequest) -> bool + Send>;
+pub type McpHandler = Box<dyn FnMut(&str, &serde_json::Value) -> std::result::Result<serde_json::Value, String> + Send>;
+pub type McpPump = Box<dyn FnMut(&mut HostSession) -> Result<()> + Send>;
+struct PendingMcp { request: crate::mcp::McpCallRequest, phase: u8 }
 
 pub struct HostSession {
     connection: Connection,
@@ -59,6 +63,12 @@ pub struct HostSession {
     settings_handler: Option<crate::settings::SettingsHandler>,
     panel_handler: Option<crate::super_panel::PanelHandler>,
     surface_request_handler: Option<SurfaceRequestHandler>,
+    scheduled_tasks: Option<Arc<Mutex<crate::scheduled_tasks::ScheduledTasks>>>,
+    mcp_handler: Option<McpHandler>,
+    mcp_negotiated: bool,
+    pending_mcp: BTreeMap<String, PendingMcp>,
+    completed_mcp: Vec<crate::mcp::McpCallReply>,
+    mcp_pump: Option<McpPump>,
 }
 
 #[derive(Default)]
@@ -302,6 +312,7 @@ impl HostSession {
         feature_id: &str,
         text: &str,
         quick_result: bool,
+        source: &str,
     ) -> Result<Ack> {
         let ownership = self.acquire(request_id)?;
         if !ownership.ok {
@@ -316,7 +327,7 @@ impl HostSession {
         let mut payload = serde_json::json!({
             "requestId": request_id,
             "ref": { "pluginId": plugin_id, "featureId": feature_id },
-            "source": "super-panel",
+            "source": source,
             "context": { "type": "text", "source": "selected-text", "text": text, "capturedAtUnixMs": captured },
         });
         if quick_result {
@@ -336,6 +347,7 @@ impl HostSession {
         plugin_id: &str,
         feature_id: &str,
         selection: &crate::projection::Selection,
+        source: &str,
     ) -> Result<Ack> {
         let ownership = self.acquire(request_id)?;
         if !ownership.ok {
@@ -365,7 +377,7 @@ impl HostSession {
         let payload = serde_json::json!({
             "requestId": request_id,
             "ref": { "pluginId": plugin_id, "featureId": feature_id },
-            "source": "super-panel",
+            "source": source,
             "context": {
                 "type": kind,
                 "source": "explorer-selection",
@@ -582,6 +594,12 @@ impl HostSession {
             quick_result_negotiated: false,
             state,
             settings_handler: None,
+            scheduled_tasks: None,
+            mcp_handler: None,
+            mcp_negotiated: false,
+            pending_mcp: BTreeMap::new(),
+            completed_mcp: Vec::new(),
+            mcp_pump: None,
             panel_handler: None,
             surface_request_handler: None,
         }
@@ -594,8 +612,86 @@ impl HostSession {
     pub fn set_settings_handler(&mut self, handler: crate::settings::SettingsHandler) {
         self.settings_handler = Some(handler);
     }
+
+    pub fn set_scheduled_tasks(&mut self, tasks: Arc<Mutex<crate::scheduled_tasks::ScheduledTasks>>) {
+        self.scheduled_tasks = Some(tasks);
+    }
     pub fn set_panel_handler(&mut self, handler: crate::super_panel::PanelHandler) {
         self.panel_handler = Some(handler);
+    }
+
+    pub fn set_mcp_handler(&mut self, handler: McpHandler) { self.mcp_handler = Some(handler); }
+    pub fn set_mcp_pump(&mut self, pump: McpPump) { self.mcp_pump = Some(pump); }
+    fn service_mcp(&mut self) -> Result<()> {
+        if let Some(mut pump) = self.mcp_pump.take() {
+            let result=pump(self); self.mcp_pump=Some(pump); result?;
+        }
+        Ok(())
+    }
+    pub fn begin_mcp_call(&mut self, request: &crate::mcp::McpCallRequest) -> Result<()> {
+        if !self.mcp_negotiated { return Err(crate::ProtocolError::Malformed("MCP capability not negotiated")); }
+        request.validate()?;
+        self.ownership.acquire(&request.call_id);
+        let envelope = Envelope::new("host-ownership-sync", self.ownership.snapshot());
+        self.pending_mcp.insert(envelope.request_id.clone(), PendingMcp { request: request.clone(), phase: 0 });
+        self.connection.send(&envelope)
+    }
+    pub fn begin_mcp_cancel(&mut self, call_id: &str) -> Result<()> {
+        let key = self.pending_mcp.iter().find(|(_, p)| p.request.call_id == call_id).map(|(key, p)| (key.clone(), p.phase));
+        if let Some((key, phase)) = key {
+            if phase < 2 {
+                self.pending_mcp.remove(&key);
+                self.ownership.complete(call_id);
+                self.completed_mcp.push(crate::mcp::McpCallReply::failed(call_id, "cancelled", "工具调用已取消。"));
+                self.sync_ownership_async()?;
+            } else { self.connection.send(&Envelope::new("mcp-call-cancel-v1", serde_json::json!({"callId":call_id})))?; }
+        }
+        Ok(())
+    }
+    pub fn take_completed_mcp_calls(&mut self) -> Vec<crate::mcp::McpCallReply> { std::mem::take(&mut self.completed_mcp) }
+    /// Called only after a cooperative host exit. Phase 2 already attempted a
+    /// tool write and remains an uncertain delivery that must never be replayed.
+    pub fn take_undelivered_mcp_calls(&mut self) -> Vec<String> {
+        let mut ids=Vec::new();
+        self.pending_mcp.retain(|_,pending| {
+            if pending.phase >= 2 { return true; }
+            self.ownership.complete(&pending.request.call_id);
+            ids.push(pending.request.call_id.clone());
+            false
+        });
+        ids
+    }
+    pub fn request_mcp_sync(&mut self) -> Result<()> { self.connection.send(&Envelope::new("mcp-sync-v1", serde_json::json!({}))) }
+    pub fn sync_ownership_async(&mut self) -> Result<()> { self.connection.send(&Envelope::new("host-ownership-sync",self.ownership.snapshot())) }
+    fn accept_async_ack(&mut self, ack: Ack) -> Result<()> {
+        let Some(mut pending) = self.pending_mcp.remove(&ack.reply_to_id) else {
+            if ack.reply_to_type == "host-ownership-sync" && ack.result.as_ref().is_some_and(|v|v["exiting"]==true) { self.closing = true; }
+            self.accept_quick_invoke_ack(ack); return Ok(());
+        };
+        let expected = if pending.phase < 2 { "host-ownership-sync" } else { "mcp-call-v1" };
+        if ack.reply_to_type != expected { self.pending_mcp.insert(ack.reply_to_id,pending); return Ok(()); }
+        if pending.phase < 2 && (self.closing
+            || ack.result.as_ref().is_some_and(|v| v["exiting"]==true)
+            || ack.error.as_ref().is_some_and(|e|e.code=="HOST_CLOSING")) {
+            self.closing=true;
+            self.pending_mcp.insert(ack.reply_to_id,pending);
+            return Ok(());
+        }
+        if !ack.ok || pending.phase == 2 {
+            let id = &pending.request.call_id;
+            let reply = if ack.ok { ack.result.and_then(|v|serde_json::from_value::<crate::mcp::McpCallReply>(v).ok())
+                .filter(|r|r.call_id==*id && ["completed","cancelled","failed","outcome-unknown"].contains(&r.status.as_str())) }
+                else { None };
+            self.completed_mcp.push(reply.unwrap_or_else(||crate::mcp::McpCallReply::failed(id,"failed","MCP 执行或所有权确认失败。")));
+            self.ownership.complete(id); return Ok(());
+        }
+        let envelope = if pending.phase == 0 {
+            self.ownership.delivered(&pending.request.call_id);
+            Envelope::new("host-ownership-sync", self.ownership.snapshot())
+        } else { Envelope::new("mcp-call-v1",serde_json::to_value(&pending.request)?) };
+        pending.phase += 1;
+        self.pending_mcp.insert(envelope.request_id.clone(),pending);
+        self.connection.send(&envelope)
     }
 
     pub fn set_surface_request_handler(&mut self, handler: SurfaceRequestHandler) {
@@ -703,10 +799,12 @@ impl HostSession {
     /// Reads one message and answers it if it is a request.
     /// Returns false when nothing arrived inside the timeout.
     pub fn pump(&mut self, timeout: Duration) -> Result<bool> {
+        self.service_mcp()?;
         let Some(message) = self.connection.poll(timeout)? else {
             return Ok(false);
         };
         self.dispatch(message)?;
+        self.service_mcp()?;
         Ok(true)
     }
 
@@ -715,9 +813,34 @@ impl HostSession {
             eprintln!("<- {}", message.kind);
         }
         match message.kind.as_str() {
+            "mcp-gateway-negotiate-v1" => {
+                if message.payload["capability"] != crate::mcp::CAPABILITY || self.mcp_handler.is_none() {
+                    return self.reply_error(&message,"CAPABILITY_REQUIRED","MCP gateway is unavailable.");
+                }
+                let result = self.mcp_handler.as_mut().unwrap()(&message.kind,&message.payload);
+                if let Err(error) = result { return self.reply_error(&message,"CAPABILITY_REQUIRED",&error); }
+                self.mcp_negotiated = true;
+                self.connection.reply(&message,true,Some(serde_json::json!({"capability":crate::mcp::CAPABILITY})))
+            }
+            "mcp-tools-update-v1" | "mcp-admin-get-v1" | "mcp-admin-set-enabled-v1" | "mcp-admin-set-plugin-enabled-v1" | "mcp-admin-preferences-v1" => {
+                if !self.mcp_negotiated { return self.reply_error(&message,"CAPABILITY_REQUIRED","MCP gateway not negotiated."); }
+                match self.mcp_handler.as_mut().unwrap()(&message.kind,&message.payload) {
+                    Ok(value)=>self.connection.reply(&message,true,Some(value)),
+                    Err(error)=>self.reply_error(&message,"MCP_UNAVAILABLE",&error),
+                }
+            }
+            "plugin-tasks-request" | "plugin-tasks-list" | "plugin-tasks-remove" | "plugin-tasks-suspend"
+            | "plugin-tasks-admin-list" | "plugin-tasks-admin-remove" => {
+                let result = self.scheduled_tasks.as_ref().ok_or_else(|| "Schedule store unavailable".to_string())
+                    .and_then(|tasks| tasks.lock().unwrap().operation(&message.kind, &message.payload));
+                match result {
+                    Ok(value) => self.connection.reply(&message, true, Some(value)),
+                    Err(error) => self.reply_error(&message, "SCHEDULE_ERROR", &error),
+                }
+            }
             "ack" => {
                 if let Ok(ack) = serde_json::from_value::<Ack>(message.payload) {
-                    self.accept_quick_invoke_ack(ack);
+                    self.accept_async_ack(ack)?;
                 }
                 Ok(())
             }
@@ -1078,6 +1201,16 @@ impl HostSession {
                 self.connection
                     .reply(&message, true, Some(serde_json::json!({})))
             }
+            "plugin-paste-text-v1" => {
+                if !has_exact_fields(&message.payload, &["text"]) {
+                    return self.reply_error(&message, "INVALID_REQUEST", "Invalid paste request.");
+                }
+                let Some(text) = message.payload["text"].as_str().filter(|text| !text.is_empty() && text.len() <= 65536 && !text.contains('\0')) else {
+                    return self.reply_error(&message, "INVALID_REQUEST", "Invalid paste text.");
+                };
+                let pasted = self.surface_request_handler.as_mut().is_some_and(|handler| handler(SurfaceRequest::PasteText { text: text.to_string() }));
+                self.connection.reply(&message, true, Some(serde_json::json!({ "pasted": pasted })))
+            }
             "launcher-show-empty" => {
                 if !has_exact_fields(&message.payload, &[]) {
                     return self.reply_error(
@@ -1235,6 +1368,7 @@ impl HostSession {
         self.connection.send(envelope)?;
         let deadline = Instant::now() + timeout;
         loop {
+            self.service_mcp()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(crate::ProtocolError::Malformed("ack timeout"));
@@ -1252,7 +1386,7 @@ impl HostSession {
                 if ack.reply_to_id == envelope.request_id && ack.reply_to_type == envelope.kind {
                     return Ok(ack);
                 }
-                self.accept_quick_invoke_ack(ack);
+                self.accept_async_ack(ack)?;
                 continue;
             }
             self.dispatch(message)?;
@@ -1262,6 +1396,7 @@ impl HostSession {
 
 impl Drop for HostSession {
     fn drop(&mut self) {
+        for pending in self.pending_mcp.values() { self.ownership.complete(&pending.request.call_id); }
         for request_id in self.pending_quick_invokes.values() {
             self.ownership.complete(request_id);
         }

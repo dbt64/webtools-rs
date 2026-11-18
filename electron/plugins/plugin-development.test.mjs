@@ -23,6 +23,43 @@ test('development source label truncates by Unicode scalar without breaking a va
   const env = await setup('a'.repeat(69) + '😀 test')
   assert.equal(env.development.nativeProjection()?.features.length, 1)
 })
+test('developer simulation uses normal authority and rejects incompatible context before activation', async () => {
+  const { development } = await setup()
+  let calls = 0
+  const input = {surface:'super-panel',context:{type:'text',source:'selected-text',text:'simulated'}}
+  development.deps.runtime = {activate: async (authority, invocation) => {
+    assert.equal(authority.development !== undefined,true)
+    assert.deepEqual(invocation,input); calls++
+  }}
+  await development.openFeature('quick',input)
+  assert.equal(calls,1)
+  await assert.rejects(development.openFeature('quick',{surface:'manager',context:null}))
+  assert.equal(calls,1)
+})
+test('reconnection requires Developer Mode and reuses only the previously selected project', async () => {
+  const {development} = await setup()
+  await assert.rejects(development.reconnect())
+  development.lastProject='D:/external/project'
+  let target
+  development.connectProject=async path=>{target=path}
+  await development.reconnect(); assert.equal(target,'D:/external/project')
+  development.enabled=false; await assert.rejects(development.reconnect())
+})
+
+test('late activation never retains context after a session or build changes', async () => {
+  for (const change of ['session', 'revision']) {
+    const { development, session } = await setup()
+    let complete
+    development.deps.runtime = { activate: () => new Promise(resolve => { complete = resolve }) }
+    const pending = development.openFeature('quick', { surface: 'super-panel', context: { type: 'text', source: 'selected-text', text: 'old project' } })
+    await Promise.resolve()
+    if (change === 'session') development.session = { ...session, revision: 1 }
+    else session.revision++
+    complete()
+    await pending
+    assert.equal(development.invocations.has('quick'), false, change)
+  }
+})
 
 test('development disconnect clears its exact session target before invalidating or revoking it', async () => {
   const { development, session } = await setup()

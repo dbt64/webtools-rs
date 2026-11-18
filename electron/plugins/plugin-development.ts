@@ -3,7 +3,9 @@ import { createConnection, type Socket } from 'node:net'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { basename, isAbsolute, join, parse, resolve, sep } from 'node:path'
 import type { PluginDevelopmentStatus } from '../../src/shared/plugin-development-contracts.ts'
-import { LIMITS_V3 } from '../../plugin-sdk/runtime-v3/manifest-v3.mjs'
+import { LIMITS_V3 } from '../../plugin-sdk/declarative-v1/runtime-v3/manifest-v3.mjs'
+import { acceptsInvocationContext } from '../../plugin-sdk/declarative-v1/web/invocation-context.mjs'
+import { parseDevelopmentInvocation, type DevelopmentInvocation } from '../../src/shared/development-invocation.ts'
 import { validPluginId } from './manifest.ts'
 import { ManagedFs, SerialQueue } from './managed-fs.ts'
 import { PluginStore } from './plugin-store.ts'
@@ -17,7 +19,7 @@ import { isFeatureRef, parseFeatureProjectionV2, normalizeFeatureText, type Feat
 interface DevelopmentMarker { protocolVersion: 1; pluginId: string; projectRoot: string; sessionId: string; pipeName: string; token: string }
 export interface DevelopmentPresentationHost {
   clearWindowTarget?(sessionId: string): void
-  activate(authority: WebFeatureAuthority): Promise<void>
+  activate(authority: WebFeatureAuthority, invocation?: DevelopmentInvocation): Promise<void>
   beginReload(sessionId: string): { featureIds: readonly string[]; ready: Promise<void>; finish(): Promise<void> }
   closeSession(sessionId: string): Promise<void>
 }
@@ -72,6 +74,8 @@ async function readRegularFile(filePath: string, limit: number): Promise<Buffer>
 }
 
 export class PluginDevelopment {
+  private lastProject: string | undefined
+  private readonly invocations = new Map<string, DevelopmentInvocation>()
   private enabled = false
   private session: DevelopmentSession | null = null
   private intent = 0
@@ -86,11 +90,11 @@ export class PluginDevelopment {
   }) {}
   get status(): PluginDevelopmentStatus {
     const s = this.session
-    return { enabled: this.enabled, connected: s?.connected ?? false,
+    return { enabled: this.enabled, connected: s?.connected ?? false, reconnectAvailable: this.enabled && !s?.connected && Boolean(this.lastProject),
       ...(s ? { project: { pluginId: s.marker.pluginId, name: s.package?.manifest.name ?? s.marker.pluginId,
         projectName: basename(s.marker.projectRoot), revision: s.revision,
         ...(s.package ? { runtimeKind: s.package.manifest.runtime.kind } : {}),
-        features: s.package?.manifest.features.map(feature => ({ id: feature.id, title: feature.title,
+        features: s.package?.manifest.features.filter(feature => !feature.mcpTool).map(feature => ({ id: feature.id, title: feature.title,
           available: supportsFeaturePresentation(s.package!.manifest, feature) })) ?? [] } } : {}),
       diagnostics: this.deps.diagnostics.list() }
   }
@@ -103,7 +107,7 @@ export class PluginDevelopment {
     if (!s || !this.current(s) || !s.package || s.package.manifest.runtime.kind !== 'node') return null
     const manifest = s.package.manifest
     return parseFeatureProjectionV2({ projectionVersion: 2, hostSessionId: s.marker.sessionId, revision: s.revision, generatedAtUnixMs: Date.now(),
-      features: manifest.features.filter(f => f.presentation?.type === 'command' && f.entry.kind === 'node-command'
+      features: manifest.features.filter(f => !f.mcpTool && f.presentation?.type === 'command' && f.entry.kind === 'node-command'
         && (selectedTextMatching || !f.acceptedContexts.some(c => c.type === 'text' && c.textMatch !== undefined))
         && f.acceptedContexts.some(c => c.type === 'text' && c.sources.includes('selected-text'))).map(f => ({
           ref: { pluginId: manifest.id, featureId: f.id }, pluginName: normalizeFeatureText(`${Array.from(manifest.name).slice(0, 70).join('')} · 开发`, 80),
@@ -116,7 +120,7 @@ export class PluginDevelopment {
     if (enabled === this.enabled) return
     this.enabled = enabled
     this.deps.diagnostics.setEnabled(enabled)
-    if (!enabled) await this.disconnect()
+    if (!enabled) { await this.disconnect(); this.lastProject = undefined }
     this.publish()
   }
   async connectProject(project: string): Promise<void> {
@@ -146,6 +150,7 @@ export class PluginDevelopment {
       authorities: new Set(), abort: new AbortController(), resolveInitial, rejectInitial }
     this.deps.diagnostics.rememberSecret(value.token)
     this.session = s
+    this.lastProject = projectRoot
     let buffer = ''
     const timeout = setTimeout(() => { rejectInitial(new Error('Development Host connection timed out. Run pnpm dev and reconnect the project.')); socket.destroy() }, 60_000)
     socket.setEncoding('utf8')
@@ -238,7 +243,7 @@ export class PluginDevelopment {
       this.publish(); s.resolveInitial()
       for (const reopenFeature of reload.featureIds) {
         if (pkg.manifest.features.some(feature => feature.id === reopenFeature)) {
-          try { await this.openFeature(reopenFeature) } catch { /* Keep diagnostics and continue restoring the other Feature windows. */ }
+          try { await this.openFeature(reopenFeature, this.invocations.get(reopenFeature)) } catch { /* Keep diagnostics and continue restoring the other Feature windows. */ }
         }
         else {
           this.failure(s, 'reload', 'DEV_FEATURE_REMOVED', new Error('The active Feature was removed from the new Manifest. Select another Feature.'), reopenFeature)
@@ -276,10 +281,14 @@ export class PluginDevelopment {
     return { pluginId: s.marker.pluginId, packageHash: s.package.hash, preloadPath,
       preloadHash: createHash('sha256').update(resource.bytes).digest('hex'), localDataPath }
   }
-  async openFeature(featureId: string): Promise<void> {
+  async reconnect(): Promise<void> {
+    if (!this.enabled || !this.lastProject) throw new Error('No previous development project in this session.')
+    await this.connectProject(this.lastProject)
+  }
+  async openFeature(featureId: string, input?: unknown): Promise<void> {
     const s = this.session
     const startedAt = Date.now()
-    try { await this.openDevelopmentFeature(featureId) }
+    try { await this.openDevelopmentFeature(featureId, input) }
     catch (error) {
       if (s && !this.deps.diagnostics.list().some(item => item.pluginId === s.marker.pluginId && item.featureId === featureId && item.timestamp >= startedAt)) {
         this.failure(s, 'runtime', 'DEV_FEATURE_OPEN_FAILED', error, featureId)
@@ -287,11 +296,22 @@ export class PluginDevelopment {
       throw error
     }
   }
-  private async openDevelopmentFeature(featureId: string): Promise<void> {
+  private async openDevelopmentFeature(featureId: string, input?: unknown): Promise<void> {
     const s = this.session
     if (!s) throw new Error('Connect a development project first.')
-    const ticket = await this.authorizeFeature({ pluginId: s.marker.pluginId, featureId }, authority => this.deps.runtime.activate(authority))
+    let invocation: DevelopmentInvocation | undefined
+    try { invocation = input === undefined ? undefined : parseDevelopmentInvocation(input) }
+    catch { throw Object.assign(new Error('Invalid simulated entry or context.'), { code: 'DEV_INVALID_CONTEXT' }) }
+    const feature = s.package?.manifest.features.find(f => f.id === featureId)
+    if (invocation && (!feature || !acceptsInvocationContext(feature.acceptedContexts, invocation.context))) throw Object.assign(new Error('Feature does not accept the simulated context.'), { code: 'DEV_CONTEXT_UNSUPPORTED' })
+    const revision = s.revision
+    const ticket = await this.authorizeFeature({ pluginId: s.marker.pluginId, featureId }, authority => this.deps.runtime.activate(authority, invocation))
     await ticket.completion
+    // Activation can finish after a disconnect or rebuild. Never restore that
+    // obsolete project's input into the next session's hot-reload state.
+    if (this.session !== s || !this.current(s) || s.revision !== revision) return
+    if (invocation) this.invocations.set(featureId, invocation)
+    else this.invocations.delete(featureId)
   }
   async authorizeFeature(ref: FeatureRef, dispatch: (authority: WebFeatureAuthority, isSourceCurrent: () => boolean) => Promise<void>): Promise<{ completion: Promise<void> }> {
     const s = this.session
@@ -319,6 +339,7 @@ export class PluginDevelopment {
     const s = this.session
     if (s) this.deps.runtime.clearWindowTarget?.(s.marker.sessionId)
     this.session = null
+    this.invocations.clear()
     if (!s) { this.publish(); return }
     s.disposed = true
     s.abort.abort()

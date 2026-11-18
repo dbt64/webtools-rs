@@ -6,6 +6,7 @@ mod native_input;
 mod panel_controller;
 
 mod clipboard;
+mod paste_target;
 mod config;
 mod file_search;
 mod mouse_gesture;
@@ -14,11 +15,15 @@ mod settings_ui;
 mod startup;
 
 mod host_runtime;
+mod mcp_dispatch;
+mod mcp_http;
+mod mcp_server;
 
 mod icons;
 mod launcher_shortcuts;
 
 mod index;
+mod catalog_watch;
 
 mod tray;
 
@@ -643,6 +648,29 @@ fn run_scroll_bench(duration_ms: u64) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    startup::trace("process-start");
+    let result = run_main();
+    if let Err(error) = &result { startup::trace(&format!("startup-error: {error}")); }
+    result
+}
+
+fn run_main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--clipboard-files-helper") {
+        use std::io::{Read, Write};
+        let mut input = String::new(); std::io::stdin().read_to_string(&mut input)?;
+        let request: serde_json::Value = serde_json::from_str(&input)?;
+        let result = match request["operation"].as_str() {
+            Some("read") => serde_json::json!(clipboard::read_files().ok_or("clipboard unavailable")?),
+            Some("write") => {
+                let paths: Vec<String> = serde_json::from_value(request["paths"].clone())?;
+                if !clipboard::set_files(&paths) { return Err("clipboard write failed".into()); }
+                serde_json::Value::Null
+            }
+            _ => return Err("invalid clipboard request".into()),
+        };
+        write!(std::io::stdout(), "{}", result)?;
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("--allow-foreground") {
         let process_id = std::env::args()
             .nth(2)

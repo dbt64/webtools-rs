@@ -79,7 +79,7 @@ pub fn is_valid_feature_invoke(payload: &Value) -> bool {
     let Some(source) = object.get("source").and_then(Value::as_str) else {
         return false;
     };
-    if source != "launcher" && source != "super-panel" {
+    if source != "launcher" && source != "super-panel" && source != "hotkey" {
         return false;
     }
 
@@ -281,7 +281,7 @@ fn is_valid_context(context: &Value, source: &str) -> bool {
     if kind != "files" && kind != "directories" {
         return false;
     }
-    if source != "super-panel" || context_source != "explorer-selection" {
+    if (source != "super-panel" && source != "hotkey") || context_source != "explorer-selection" {
         return false;
     }
     if object.get("text").is_some_and(|value| !value.is_null()) {
@@ -382,6 +382,21 @@ mod tests {
             "hello",
             "super-panel"
         )));
+    }
+
+    #[test]
+    fn hotkey_accepts_selected_text_and_explorer_files_but_not_quick_result() {
+        assert!(is_valid_feature_invoke(&text_request("hello", "hotkey")));
+        let mut files = json!({
+            "requestId": request_id(),
+            "ref": { "pluginId": "org.example.plugin", "featureId": "image" },
+            "source": "hotkey",
+            "context": { "type": "files", "source": "explorer-selection", "capturedAtUnixMs": 1u64,
+                "items": [{ "kind": "file", "path": "C:\\a.png" }] }
+        });
+        assert!(is_valid_feature_invoke(&files));
+        files["quickResult"] = json!({"version": 1});
+        assert!(!is_valid_feature_invoke(&files));
     }
 
     #[test]
